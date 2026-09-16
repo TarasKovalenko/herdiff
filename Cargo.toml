@@ -1,0 +1,17 @@
+[package]
+name = "herdiff"
+version = "0.1.0"
+edition = "2024"
+description = "Live diff viewer for the git repos your herdr agents are working in"
+repository = "https://github.com/TarasKovalenko/herdiff"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+crossterm = "0.29.0"
+ratatui = "0.30.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+
+[dev-dependencies]
+tempfile = "3.27.0"
