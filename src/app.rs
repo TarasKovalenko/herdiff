@@ -7,12 +7,12 @@ use std::time::Instant;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 
-use crate::diff::{DiffLine, LineKind, Rows};
-use crate::git::{FileChange, Mode};
+use crate::diff::{self, DiffLine, LineKind, Rows};
+use crate::git::{FileChange, GitOp, Mode};
 use crate::highlight::Highlights;
 use crate::model::RepoGroup;
 use crate::scope::{Scope, Target};
-use crate::worker::{DiffResult, Refreshed};
+use crate::worker::{DiffResult, GitDone, Refreshed};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -104,7 +104,35 @@ pub enum Action {
     Refresh,
     LoadDiff,
     FocusPane(String),
-    OpenEditor { path: PathBuf, line: Option<u32> },
+    OpenEditor {
+        path: PathBuf,
+        line: Option<u32>,
+    },
+    /// Run a git write in the worker.
+    Git {
+        root: PathBuf,
+        op: GitOp,
+    },
+    /// Suspend the TUI and run an interactive `git commit` (editor, signing prompts).
+    ExternalCommit {
+        root: PathBuf,
+    },
+}
+
+/// The inline commit message editor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitBox {
+    pub root: PathBuf,
+    pub message: String,
+    /// Waiting for `git commit` (hooks can take a while).
+    pub busy: bool,
+}
+
+/// A modal message, for errors and hook output that don't fit the status bar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notice {
+    pub title: String,
+    pub body: String,
 }
 
 pub struct App {
@@ -136,6 +164,10 @@ pub struct App {
     pending_scroll: Option<Saved>,
     /// Set by the renderer every frame.
     pub hit: HitMap,
+    /// Started with `--read-only`: no staging or committing.
+    pub read_only: bool,
+    pub commit: Option<CommitBox>,
+    pub notice: Option<Notice>,
 }
 
 impl App {
@@ -163,6 +195,9 @@ impl App {
             saved: HashMap::new(),
             pending_scroll: None,
             hit: HitMap::default(),
+            read_only: false,
+            commit: None,
+            notice: None,
         }
     }
 
@@ -310,6 +345,12 @@ impl App {
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
+        if self.notice.take().is_some() {
+            return Action::None;
+        }
+        if self.commit.is_some() {
+            return self.commit_key(key);
+        }
         if self.show_help {
             self.show_help = false;
             return Action::None;
@@ -344,7 +385,15 @@ impl App {
             KeyCode::Char('u') if ctrl => self.scroll_diff(-(self.page() as isize / 2)),
             KeyCode::Char('J') => self.scroll_diff(1),
             KeyCode::Char('K') => self.scroll_diff(-1),
-            KeyCode::PageDown | KeyCode::Char(' ') => self.scroll_diff(self.page() as isize),
+            KeyCode::PageDown | KeyCode::Char('f') => self.scroll_diff(self.page() as isize),
+            KeyCode::Char(' ') => self.toggle_stage(),
+            KeyCode::Char('A') => self.repo_write(|_| GitOp::StageAll),
+            KeyCode::Char('R') => self.repo_write(|_| GitOp::UnstageAll),
+            KeyCode::Char('c') => self.open_commit(),
+            KeyCode::Char('C') => match self.writable_repo() {
+                Some(root) => Action::ExternalCommit { root },
+                None => Action::None,
+            },
             KeyCode::PageUp | KeyCode::Char('b') => self.scroll_diff(-(self.page() as isize)),
             KeyCode::Char('g') | KeyCode::Home => self.scroll_diff(isize::MIN / 2),
             KeyCode::Char('G') | KeyCode::End => self.scroll_diff(isize::MAX / 2),
@@ -390,7 +439,208 @@ impl App {
         }
     }
 
+    /// Bracketed paste: only the commit message takes text.
+    pub fn on_paste(&mut self, text: &str) {
+        if let Some(c) = self.commit.as_mut().filter(|c| !c.busy) {
+            c.message
+                .push_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
+        }
+    }
+
+    /// A git write finished. The caller refreshes either way.
+    pub fn apply_git_done(&mut self, done: GitDone) {
+        let is_commit = matches!(done.op, GitOp::Commit { .. });
+        match done.result {
+            Ok(summary) => {
+                if is_commit {
+                    self.commit = None;
+                }
+                self.flash(summary);
+            }
+            Err(err) => {
+                if let Some(c) = self.commit.as_mut().filter(|_| is_commit) {
+                    c.busy = false; // keep the message so a failed hook doesn't lose it
+                }
+                self.notice = Some(Notice {
+                    title: format!("{} failed", op_name(&done.op)),
+                    body: err,
+                });
+            }
+        }
+    }
+
+    /// Agents currently working in the selected repo, for the commit warning.
+    pub fn working_agents(&self) -> Vec<String> {
+        self.repo()
+            .map(|g| {
+                g.panes
+                    .iter()
+                    .filter(|p| p.status.as_deref() == Some("working"))
+                    .filter_map(|p| p.agent.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn staged_count(&self) -> usize {
+        self.repo()
+            .and_then(|g| g.stats.as_ref().ok())
+            .map_or(0, |s| s.staged)
+    }
+
+    fn writable_repo(&mut self) -> Option<PathBuf> {
+        if self.read_only {
+            self.flash("read-only: herdiff was started with --read-only");
+            return None;
+        }
+        let root = self.repo().map(|g| g.root.clone());
+        if root.is_none() {
+            self.flash("no repo selected");
+        }
+        root
+    }
+
+    fn repo_write(&mut self, op: impl FnOnce(&Self) -> GitOp) -> Action {
+        match self.writable_repo() {
+            Some(root) => Action::Git { root, op: op(self) },
+            None => Action::None,
+        }
+    }
+
+    /// `space`: the selected file in the file list, the hunk at the top of the diff.
+    fn toggle_stage(&mut self) -> Action {
+        match self.focus {
+            Focus::Diff => self.toggle_stage_hunk(),
+            Focus::Files => self.toggle_stage_file(),
+            Focus::Repos => Action::None,
+        }
+    }
+
+    fn toggle_stage_file(&mut self) -> Action {
+        let Some(f) = self.file().cloned() else {
+            return Action::None;
+        };
+        let paths = vec![f.path.clone()];
+        // The mode says what the user is looking at: unstage in staged mode, stage in
+        // unstaged mode, otherwise stage whatever is left and unstage when nothing is.
+        let op = match self.mode {
+            Mode::Staged if f.has_staged() => GitOp::Unstage(paths),
+            Mode::Unstaged if f.has_unstaged() => GitOp::Stage(paths),
+            _ if f.has_unstaged() => GitOp::Stage(paths),
+            _ if f.has_staged() => GitOp::Unstage(paths),
+            _ => {
+                self.flash(format!("{} has no local changes to stage", f.path));
+                return Action::None;
+            }
+        };
+        self.repo_write(|_| op)
+    }
+
+    fn toggle_stage_hunk(&mut self) -> Action {
+        let Some(f) = self.file().cloned() else {
+            return Action::None;
+        };
+        if f.status == crate::git::Status::Untracked {
+            // An untracked file is one hunk anyway.
+            return self.repo_write(|_| GitOp::Stage(vec![f.path]));
+        }
+        let reverse = match self.mode {
+            Mode::Unstaged => false,
+            Mode::Staged => true,
+            _ => {
+                self.flash("hunks can be staged in unstaged mode and unstaged in staged mode (m)");
+                return Action::None;
+            }
+        };
+        let root = self.repo().map(|g| g.root.clone());
+        let Some(view) = self
+            .diff
+            .as_ref()
+            .filter(|v| Some(&v.root) == root.as_ref() && v.path == f.path && v.mode == self.mode)
+        else {
+            // A refresh can move the selection before the new diff arrives.
+            self.flash("diff is still loading");
+            return Action::None;
+        };
+        let target = view.lines.as_ref().ok().and_then(|lines| {
+            let start = diff::hunk_start(lines, view.scroll)?;
+            Some((diff::hunk_index(lines, start), lines[start].text.clone()))
+        });
+        match target {
+            Some((hunk, header)) => self.repo_write(|_| GitOp::ApplyHunk {
+                path: f.path,
+                hunk,
+                header,
+                reverse,
+            }),
+            None => {
+                self.flash("no hunk here");
+                Action::None
+            }
+        }
+    }
+
+    fn open_commit(&mut self) -> Action {
+        let Some(root) = self.writable_repo() else {
+            return Action::None;
+        };
+        if self.staged_count() == 0 {
+            self.flash("nothing staged: press space on a file or hunk, or A for everything");
+            return Action::None;
+        }
+        self.commit = Some(CommitBox {
+            root,
+            message: String::new(),
+            busy: false,
+        });
+        Action::None
+    }
+
+    fn commit_key(&mut self, key: KeyEvent) -> Action {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(c) = self.commit.as_mut() else {
+            return Action::None;
+        };
+        if c.busy {
+            return Action::None; // git is running; its result closes or reopens the box
+        }
+        match key.code {
+            KeyCode::Esc => self.commit = None,
+            KeyCode::Char('s') if ctrl => {
+                if c.message.trim().is_empty() {
+                    self.flash("write a commit message first");
+                    return Action::None;
+                }
+                c.busy = true;
+                return Action::Git {
+                    root: c.root.clone(),
+                    op: GitOp::Commit {
+                        message: c.message.clone(),
+                    },
+                };
+            }
+            KeyCode::Char('u') if ctrl => c.message.clear(),
+            KeyCode::Enter => c.message.push('\n'),
+            KeyCode::Tab => c.message.push_str("    "),
+            KeyCode::Backspace => {
+                c.message.pop();
+            }
+            KeyCode::Char(ch) if !ctrl => c.message.push(ch),
+            _ => {}
+        }
+        Action::None
+    }
+
     pub fn on_mouse(&mut self, ev: MouseEvent) -> Action {
+        if self.commit.is_some() {
+            return Action::None;
+        }
+        if self.notice.is_some() {
+            if matches!(ev.kind, MouseEventKind::Down(_)) {
+                self.notice = None;
+            }
+            return Action::None;
+        }
         if self.show_help {
             if matches!(ev.kind, MouseEventKind::Down(_)) {
                 self.show_help = false;
@@ -592,6 +842,15 @@ impl App {
     }
 }
 
+fn op_name(op: &GitOp) -> &'static str {
+    match op {
+        GitOp::Stage(_) | GitOp::StageAll => "git add",
+        GitOp::Unstage(_) | GitOp::UnstageAll => "unstage",
+        GitOp::ApplyHunk { .. } => "git apply",
+        GitOp::Commit { .. } => "git commit",
+    }
+}
+
 fn clamp(idx: isize, len: usize) -> usize {
     idx.clamp(0, len.saturating_sub(1) as isize) as usize
 }
@@ -616,6 +875,8 @@ mod tests {
             status: Status::Modified,
             added: Some(1),
             removed: Some(0),
+            index: ' ',
+            worktree: 'M',
         }
     }
 
@@ -858,6 +1119,195 @@ mod tests {
         assert_eq!(app.on_mouse(mouse(down, 5, 4)), Action::None);
         assert!(!app.show_help);
         assert_eq!(app.repo().unwrap().root, PathBuf::from("/a"));
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn with_file_state(app: &mut App, index: char, worktree: char, staged: usize) {
+        if let Ok(stats) = &mut app.groups[app.repo_idx].stats {
+            for f in &mut stats.files {
+                f.index = index;
+                f.worktree = worktree;
+            }
+            stats.staged = staged;
+        }
+    }
+
+    #[test]
+    fn space_stages_or_unstages_the_selected_file() {
+        let mut app = App::new(Mode::Uncommitted, View::Unified);
+        app.apply_refresh(refreshed(vec![group("/a", &["x"])]));
+        app.focus = Focus::Files;
+
+        with_file_state(&mut app, ' ', 'M', 0);
+        assert_eq!(
+            app.on_key(key(' ')),
+            Action::Git {
+                root: "/a".into(),
+                op: GitOp::Stage(vec!["x".into()])
+            }
+        );
+        with_file_state(&mut app, 'M', ' ', 1);
+        assert_eq!(
+            app.on_key(key(' ')),
+            Action::Git {
+                root: "/a".into(),
+                op: GitOp::Unstage(vec!["x".into()])
+            }
+        );
+        // Partly staged: staged mode unstages, other modes stage the rest.
+        with_file_state(&mut app, 'M', 'M', 1);
+        assert!(matches!(
+            app.on_key(key(' ')),
+            Action::Git {
+                op: GitOp::Stage(_),
+                ..
+            }
+        ));
+        app.mode = Mode::Staged;
+        assert!(matches!(
+            app.on_key(key(' ')),
+            Action::Git {
+                op: GitOp::Unstage(_),
+                ..
+            }
+        ));
+
+        assert_eq!(
+            app.on_key(key('A')),
+            Action::Git {
+                root: "/a".into(),
+                op: GitOp::StageAll
+            }
+        );
+        assert_eq!(
+            app.on_key(key('R')),
+            Action::Git {
+                root: "/a".into(),
+                op: GitOp::UnstageAll
+            }
+        );
+    }
+
+    #[test]
+    fn space_in_diff_stages_the_hunk_only_where_it_applies() {
+        let mut app = App::new(Mode::Unstaged, View::Unified);
+        app.apply_refresh(Refreshed {
+            mode: Mode::Unstaged,
+            ..refreshed(vec![group("/a", &["x"])])
+        });
+        app.apply_diff(DiffResult {
+            root: "/a".into(),
+            mode: Mode::Unstaged,
+            path: "x".into(),
+            lines: Ok(crate::diff::parse_unified(
+                "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n",
+            )),
+            highlights: Vec::new(),
+        });
+        app.focus = Focus::Diff;
+        assert_eq!(
+            app.on_key(key(' ')),
+            Action::Git {
+                root: "/a".into(),
+                op: GitOp::ApplyHunk {
+                    path: "x".into(),
+                    hunk: 0,
+                    header: "@@ -1 +1 @@".into(),
+                    reverse: false,
+                }
+            }
+        );
+        // The loaded diff belongs to another file: refuse rather than stage the wrong hunk.
+        app.diff.as_mut().unwrap().path = "other".into();
+        assert_eq!(app.on_key(key(' ')), Action::None);
+        assert_eq!(app.message.as_ref().unwrap().0, "diff is still loading");
+        app.diff.as_mut().unwrap().path = "x".into();
+        app.mode = Mode::Uncommitted;
+        assert_eq!(app.on_key(key(' ')), Action::None);
+        assert!(app.message.as_ref().unwrap().0.contains("unstaged mode"));
+    }
+
+    #[test]
+    fn commit_box_flow() {
+        let mut app = App::new(Mode::Uncommitted, View::Unified);
+        app.apply_refresh(refreshed(vec![group("/a", &["x"])]));
+
+        // Nothing staged: no box.
+        assert_eq!(app.on_key(key('c')), Action::None);
+        assert!(app.commit.is_none());
+
+        with_file_state(&mut app, 'M', ' ', 1);
+        app.on_key(key('c'));
+        assert!(app.commit.is_some());
+        // Keys type into the message instead of running commands.
+        for ch in "Fix q".chars() {
+            assert_eq!(app.on_key(key(ch)), Action::None);
+        }
+        app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.on_paste("body\r\nmore");
+        assert_eq!(app.commit.as_ref().unwrap().message, "Fix \nbody\nmore");
+
+        let action = app.on_key(ctrl('s'));
+        assert_eq!(
+            action,
+            Action::Git {
+                root: "/a".into(),
+                op: GitOp::Commit {
+                    message: "Fix \nbody\nmore".into()
+                }
+            }
+        );
+        // While git runs, input is ignored.
+        assert_eq!(app.on_key(key('x')), Action::None);
+        assert!(app.commit.as_ref().unwrap().busy);
+
+        // A failing hook keeps the message and shows the output.
+        app.apply_git_done(GitDone {
+            root: "/a".into(),
+            op: GitOp::Commit {
+                message: String::new(),
+            },
+            result: Err("pre-commit hook failed".into()),
+        });
+        let c = app.commit.as_ref().unwrap();
+        assert!(!c.busy && c.message.starts_with("Fix"));
+        assert_eq!(app.notice.as_ref().unwrap().title, "git commit failed");
+        app.on_key(key('z')); // closes the notice, doesn't type
+        assert!(app.notice.is_none());
+        assert_eq!(app.commit.as_ref().unwrap().message, "Fix \nbody\nmore");
+
+        app.on_key(ctrl('s'));
+        app.apply_git_done(GitDone {
+            root: "/a".into(),
+            op: GitOp::Commit {
+                message: String::new(),
+            },
+            result: Ok("[main abc123] Fix".into()),
+        });
+        assert!(app.commit.is_none());
+        assert_eq!(app.message.as_ref().unwrap().0, "[main abc123] Fix");
+
+        app.on_key(key('c'));
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.commit.is_none());
+    }
+
+    #[test]
+    fn read_only_blocks_writes() {
+        let mut app = App::new(Mode::Uncommitted, View::Unified);
+        app.read_only = true;
+        app.apply_refresh(refreshed(vec![group("/a", &["x"])]));
+        with_file_state(&mut app, ' ', 'M', 1);
+        app.focus = Focus::Files;
+        for k in [' ', 'A', 'R', 'c', 'C'] {
+            assert_eq!(app.on_key(key(k)), Action::None, "{k}");
+        }
+        assert!(app.commit.is_none());
+        assert!(app.message.as_ref().unwrap().0.contains("--read-only"));
     }
 
     #[test]

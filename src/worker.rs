@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::diff::{self, DiffLine};
-use crate::git::{self, FileChange, Mode};
+use crate::git::{self, FileChange, GitOp, Mode};
 use crate::herdr::Client;
 use crate::herdr::Snapshot;
 use crate::highlight::{Highlighter, Highlights};
@@ -28,6 +28,18 @@ pub enum Job {
     },
     /// Record herdr focus without touching git (focus moved while the scope isn't follow).
     ObserveFocus,
+    /// A write the user asked for. Never coalesced: every one runs, in order.
+    Git {
+        root: PathBuf,
+        op: GitOp,
+    },
+}
+
+pub struct GitDone {
+    pub root: PathBuf,
+    pub op: GitOp,
+    /// Summary line on success, git's output on failure.
+    pub result: Result<String, String>,
 }
 
 pub struct Refreshed {
@@ -50,6 +62,7 @@ pub struct DiffResult {
 pub enum AppEvent {
     Refreshed(Refreshed),
     Diff(DiffResult),
+    GitDone(GitDone),
     /// herdr reported a change. `focus` = only focus moved (matters for `Scope::Follow`).
     HerdrChanged {
         focus: bool,
@@ -91,15 +104,27 @@ pub fn spawn_git_worker(
         let mut roots = RootCache::default();
         let mut resolver = Resolver::default();
         while let Ok(first) = jobs.recv() {
-            // Coalesce queued jobs: keep only the latest refresh and latest diff.
+            // Coalesce queued reads: keep only the latest refresh and latest diff.
+            // Writes all run, in order, before the reads so those see the result.
             let mut refresh = None;
             let mut diff = None;
             let mut observe = false;
+            let mut writes = Vec::new();
             for job in std::iter::once(first).chain(jobs.try_iter()) {
                 match job {
                     Job::Refresh { mode, scope } => refresh = Some((mode, scope)),
                     d @ Job::Diff { .. } => diff = Some(d),
                     Job::ObserveFocus => observe = true,
+                    Job::Git { root, op } => writes.push((root, op)),
+                }
+            }
+            for (root, op) in writes {
+                let result = git::apply_op(&root, &op).map_err(|e| format!("{e:#}"));
+                if out
+                    .send(AppEvent::GitDone(GitDone { root, op, result }))
+                    .is_err()
+                {
+                    return;
                 }
             }
             // A refresh observes focus itself.

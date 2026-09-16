@@ -21,8 +21,14 @@ herdiff runs locally with your user's permissions. It connects to the herdr sock
 point it at (by default `$HERDR_SOCKET_PATH` or `~/.config/herdr/herdr.sock`) and runs
 `git` in the repos your herdr panes are working in.
 
-- It only reads from git. Every call runs with `GIT_OPTIONAL_LOCKS=0`, so it doesn't
+- The background refresh only reads from git, with `GIT_OPTIONAL_LOCKS=0`, so it doesn't
   write `index.lock` or refresh the index.
+- Writes happen only when you press a key for them: `git add`, `git restore --staged`,
+  `git reset`, `git rm --cached` (in a repo with no commits yet), `git apply --cached` for
+  a single hunk, and `git commit`. herdiff never pushes, amends, discards changes or
+  deletes a lock file. `--read-only` disables all of these.
+- Committing runs your repository's hooks, as `git commit` always does. A hook in a repo
+  you don't trust is code you don't trust.
 - The only herdr commands it sends are `session.snapshot`, `events.subscribe` and
   `pane.focus` (when you press `a`).
 - `e` starts `$VISUAL` or `$EDITOR` on the selected file. Treat those variables with the

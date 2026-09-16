@@ -68,7 +68,17 @@ fn main() -> Result<()> {
     app.on_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
     shot(&mut app, "help", 160, 40)?;
 
-    println!("wrote {OUT}/split.svg, unified.svg, help.svg");
+    // 4. Staging and committing: part of the work staged, commit message being written.
+    let mut app = demo.app(Scope::Follow, Some("w1"), View::Split)?;
+    select(&mut app, &hl, "src/refund.rs")?;
+    app.focus = Focus::Files;
+    app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+    app.on_paste(
+        "Document partial refunds\n\nBump to 0.5.0 and describe how repeated refunds work.",
+    );
+    shot(&mut app, "commit", 160, 40)?;
+
+    println!("wrote {OUT}/split.svg, unified.svg, help.svg, commit.svg");
     Ok(())
 }
 
@@ -350,6 +360,8 @@ tracing = "0.1"
         "docs/refunds.md",
         "# Partial refunds\n\nA payment can be refunded several times until nothing is left.\n",
     )?;
+    // Some of it already staged, as it would be mid-review.
+    git(dir, &["add", "Cargo.toml", "docs/refunds.md"])?;
     Ok(())
 }
 

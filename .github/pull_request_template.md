@@ -10,5 +10,5 @@
 
 - [ ] `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test --all-targets` pass
 - [ ] New behaviour has tests
-- [ ] Git stays read-only and runs with `GIT_OPTIONAL_LOCKS=0`
+- [ ] Refreshes stay read-only (`GIT_OPTIONAL_LOCKS=0`); any git write goes through `git::apply_op` and respects `--read-only`
 - [ ] New keys are in the help screen and the README

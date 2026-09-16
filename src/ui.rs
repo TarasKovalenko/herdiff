@@ -10,7 +10,7 @@ use crate::app::{App, Focus};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::diff::{DiffLine, LineKind, Row};
-use crate::git::Status;
+use crate::git::Mode;
 use crate::highlight::{Fg, Highlights, HlSpan};
 
 const ADD_FG: Color = Color::Green;
@@ -57,6 +57,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_status(f, app, status);
     if app.show_help {
         draw_help(f);
+    }
+    if app.commit.is_some() {
+        draw_commit(f, app);
+    }
+    if let Some(notice) = &app.notice {
+        draw_notice(f, notice);
     }
 }
 
@@ -225,7 +231,12 @@ fn draw_files(f: &mut Frame, app: &App, area: Rect) -> usize {
             return 0;
         }
     };
-    let title = format!(" Files ({}) vs {} ", stats.files.len(), stats.base);
+    let staged = if stats.staged > 0 {
+        format!("· {} staged ", stats.staged)
+    } else {
+        String::new()
+    };
+    let title = format!(" Files ({}) vs {} {staged}", stats.files.len(), stats.base);
     if stats.files.is_empty() {
         f.render_widget(
             Paragraph::new(format!("no {} changes", app.mode.label()))
@@ -240,11 +251,18 @@ fn draw_files(f: &mut Frame, app: &App, area: Rect) -> usize {
         .files
         .iter()
         .map(|file| {
-            let color = match file.status {
-                Status::Added | Status::Untracked => ADD_FG,
-                Status::Deleted => DEL_FG,
-                Status::Modified => Color::Yellow,
-                _ => Color::Magenta,
+            // Two columns like `git status -s`: staged (green), then unstaged (red).
+            let marks = match (file.index, file.worktree) {
+                ('?', _) => vec![Span::styled("??", Style::new().fg(ADD_FG).bold())],
+                // Only in branch mode: committed on the branch, nothing local.
+                (' ', ' ') => vec![Span::styled(
+                    format!("{} ", file.status.letter()),
+                    Style::new().fg(DIM),
+                )],
+                (x, y) => vec![
+                    Span::styled(x.to_string(), Style::new().fg(ADD_FG).bold()),
+                    Span::styled(y.to_string(), Style::new().fg(DEL_FG).bold()),
+                ],
             };
             let cnt = if file.is_dir() {
                 vec![Span::styled("repo", Style::new().fg(DIM))]
@@ -252,14 +270,12 @@ fn draw_files(f: &mut Frame, app: &App, area: Rect) -> usize {
                 counts(file.added, file.removed)
             };
             let cnt_len: usize = cnt.iter().map(|s| s.content.chars().count()).sum();
-            let path_w = width.saturating_sub(cnt_len + 3);
-            let mut spans = vec![
-                Span::styled(
-                    format!("{} ", file.status.letter()),
-                    Style::new().fg(color).bold(),
-                ),
-                Span::raw(format!("{:<path_w$} ", truncate_left(&file.path, path_w))),
-            ];
+            let path_w = width.saturating_sub(cnt_len + 4);
+            let mut spans = marks;
+            spans.push(Span::raw(format!(
+                " {:<path_w$} ",
+                truncate_left(&file.path, path_w)
+            )));
             spans.extend(cnt);
             ListItem::new(Line::from(spans))
         })
@@ -312,9 +328,18 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
         Span::styled(format!(" {pos}/{} ", rows.rows.len()), Style::new().fg(DIM)),
         Span::styled(if split { "split " } else { "" }, Style::new().fg(DIM)),
     ]);
+    // Mark the hunk `space` would act on, when it would act on one.
+    let hunk_action = match app.mode {
+        _ if app.read_only || !focused => None,
+        Mode::Unstaged => Some(" space: stage hunk "),
+        Mode::Staged => Some(" space: unstage hunk "),
+        _ => None,
+    };
+    let active_hunk = crate::diff::hunk_start(lines, view.scroll).zip(hunk_action);
     let ctx = CodeCtx {
         lines,
         highlights: &view.highlights,
+        active_hunk,
         hscroll: view.hscroll,
         num_w: lines
             .iter()
@@ -361,6 +386,8 @@ enum Side {
 struct CodeCtx<'a> {
     lines: &'a [DiffLine],
     highlights: &'a Highlights,
+    /// Hunk header index and the label to show on it.
+    active_hunk: Option<(usize, &'static str)>,
     hscroll: usize,
     num_w: usize,
 }
@@ -372,8 +399,22 @@ impl CodeCtx<'_> {
             LineKind::Hunk => Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
             _ => Style::new().fg(DIM),
         };
-        let text = clip(&l.text, self.hscroll, width, false);
-        Line::from(Span::styled(text, style))
+        match self.active_hunk {
+            Some((active, label)) if active == i => {
+                let badge = Span::styled(label, Style::new().fg(Color::Black).bg(ACCENT).bold());
+                let rest = clip(
+                    &l.text,
+                    self.hscroll,
+                    width.saturating_sub(label.width() + 1),
+                    false,
+                );
+                Line::from(vec![badge, Span::raw(" "), Span::styled(rest, style)])
+            }
+            _ => Line::from(Span::styled(
+                clip(&l.text, self.hscroll, width, false),
+                style,
+            )),
+        }
     }
 
     fn num(&self, n: Option<u32>) -> String {
@@ -545,12 +586,119 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
             Style::new().fg(Color::Yellow),
         ));
     }
-    let hint = " w scope  s split  m mode  a agent  e edit  ? help  q quit ";
+    let hint = if app.read_only {
+        " read-only  w scope  s split  m mode  a agent  ? help  q quit "
+    } else {
+        " space stage  c commit  w scope  s split  m mode  ? help  q quit "
+    };
     let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
     let pad = (area.width as usize).saturating_sub(used + hint.len());
     spans.push(Span::raw(" ".repeat(pad)));
     spans.push(Span::styled(hint, Style::new().fg(DIM)));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn centered(area: Rect, w: u16, h: u16) -> Rect {
+    let (w, h) = (w.min(area.width), h.min(area.height));
+    Rect::new(
+        area.x + (area.width - w) / 2,
+        area.y + (area.height - h) / 2,
+        w,
+        h,
+    )
+}
+
+fn draw_commit(f: &mut Frame, app: &App) {
+    let Some(c) = &app.commit else { return };
+    let rect = centered(f.area(), 76, 16);
+    let repo = app.repo().map_or("", |g| g.name.as_str());
+    let branch = app
+        .repo()
+        .and_then(|g| g.stats.as_ref().ok())
+        .map_or(String::new(), |s| format!(" ({})", s.branch));
+    let title = format!(" Commit {} staged to {repo}{branch} ", app.staged_count());
+    let block = block(title, true);
+    let inner = block.inner(rect);
+    f.render_widget(Clear, rect);
+    f.render_widget(block, rect);
+
+    let mut rows = Vec::new();
+    let working = app.working_agents();
+    if !working.is_empty() {
+        rows.push(Line::from(Span::styled(
+            format!("⚠ {} still working in this repo", working.join(", ")),
+            Style::new().fg(Color::Yellow).bold(),
+        )));
+    }
+    let text_h = (inner.height as usize)
+        .saturating_sub(rows.len() + 2)
+        .max(1);
+    let width = inner.width as usize;
+    // Soft-wrap the message by display width and keep the end (where typing happens) in view.
+    let mut msg_lines: Vec<String> = Vec::new();
+    for raw in c.message.split('\n') {
+        let mut line = String::new();
+        for ch in raw.chars() {
+            if line.width() + ch.width().unwrap_or(0) > width.saturating_sub(1) {
+                msg_lines.push(std::mem::take(&mut line));
+            }
+            line.push(ch);
+        }
+        msg_lines.push(line);
+    }
+    if !c.busy
+        && let Some(last) = msg_lines.last_mut()
+    {
+        last.push('▏');
+    }
+    let skip = msg_lines.len().saturating_sub(text_h);
+    for (i, l) in msg_lines.iter().enumerate().skip(skip) {
+        // Git uses the first line as the subject.
+        let style = if i == 0 {
+            Style::new().bold()
+        } else {
+            Style::new()
+        };
+        rows.push(Line::from(Span::styled(l.clone(), style)));
+    }
+    if c.message.is_empty() {
+        rows.push(Line::from(Span::styled(
+            "subject line, blank line, then details",
+            Style::new().fg(DIM),
+        )));
+    }
+    f.render_widget(Paragraph::new(rows), inner);
+
+    let footer = if c.busy {
+        Span::styled(
+            " committing… (hooks run here) ",
+            Style::new().fg(Color::Yellow),
+        )
+    } else {
+        Span::styled(
+            " ctrl-s commit · enter newline · ctrl-u clear · esc cancel ",
+            Style::new().fg(DIM),
+        )
+    };
+    let footer_area = Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1);
+    f.render_widget(Paragraph::new(Line::from(footer)), footer_area);
+}
+
+fn draw_notice(f: &mut Frame, notice: &crate::app::Notice) {
+    let lines = notice.body.lines().count() as u16;
+    let rect = centered(f.area(), 90, lines + 5);
+    let block = Block::bordered()
+        .border_type(BorderType::Thick)
+        .border_style(Style::new().fg(DEL_FG))
+        .title(format!(" {} ", notice.title))
+        .title_bottom(Line::from(" any key to close ").right_aligned());
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Paragraph::new(notice.body.clone())
+            .wrap(Wrap { trim: false })
+            .block(block.padding(ratatui::widgets::Padding::horizontal(1))),
+        rect,
+    );
 }
 
 /// `all`, `follow: MedInsight`, `here: h-diff`. Shows the requested scope while its
@@ -572,11 +720,15 @@ fn draw_help(f: &mut Frame) {
         ("j k / ↓ ↑", "move selection (scroll in diff)"),
         ("[ ]", "previous / next file"),
         ("J K", "scroll diff by line"),
-        ("space b / pgdn pgup", "scroll diff by page"),
+        ("f b / pgdn pgup", "scroll diff by page"),
         ("ctrl-d ctrl-u", "scroll diff half page"),
         ("g G", "diff top / bottom"),
         ("n N", "next / previous hunk"),
         ("H L", "scroll diff horizontally"),
+        ("space", "stage / unstage the file, or the marked hunk"),
+        ("A R", "stage all / unstage all"),
+        ("c", "commit staged changes (ctrl-s commits)"),
+        ("C", "run git commit in the terminal (editor, signing)"),
         ("s", "toggle side-by-side / unified view"),
         ("w", "cycle scope: all → follow focus → here"),
         ("m", "cycle mode: uncommitted → unstaged → staged → branch"),
@@ -637,7 +789,7 @@ fn truncate_left(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use crate::diff::parse_unified;
-    use crate::git::{FileChange, Mode, RepoStats};
+    use crate::git::{FileChange, RepoStats, Status};
     use crate::model::{PaneRef, RepoGroup};
     use crate::scope::{Scope, Target};
     use crate::worker::{DiffResult, Refreshed};
@@ -662,6 +814,8 @@ mod tests {
             status: Status::Modified,
             added: Some(1),
             removed: Some(1),
+            index: ' ',
+            worktree: 'M',
         };
         let groups = vec![RepoGroup {
             root: "/r/proj".into(),
@@ -679,6 +833,7 @@ mod tests {
                 branch: "main".into(),
                 base: "HEAD".into(),
                 files: vec![file],
+                staged: 0,
             }),
         }];
         app.apply_refresh(Refreshed {
@@ -762,6 +917,94 @@ mod tests {
         });
         let screen = render_app(app, 160, 40);
         assert!(screen.contains("ENDMARK"), "{screen}");
+    }
+
+    #[test]
+    fn files_show_staged_and_unstaged_columns() {
+        let mut app = app();
+        if let Ok(stats) = &mut app.groups[0].stats {
+            stats.files[0].index = 'M';
+            stats.files[0].worktree = 'M';
+            stats.staged = 1;
+        }
+        let screen = render_app(app, 160, 30);
+        assert!(screen.contains("MM src/lib.rs"), "{screen}");
+        assert!(screen.contains("· 1 staged"), "{screen}");
+    }
+
+    #[test]
+    fn commit_box_warns_about_working_agents() {
+        let mut app = app();
+        app.commit = Some(crate::app::CommitBox {
+            root: "/r/proj".into(),
+            message: "Fix the bug\n\nBecause reasons".into(),
+            busy: false,
+        });
+        let screen = render_app(app, 160, 40);
+        assert!(
+            screen.contains("⚠ claude still working in this repo"),
+            "{screen}"
+        );
+        assert!(screen.contains("Fix the bug"), "{screen}");
+        assert!(screen.contains("Because reasons▏"), "{screen}");
+        assert!(screen.contains("ctrl-s commit"), "{screen}");
+    }
+
+    #[test]
+    fn active_hunk_is_marked_in_unstaged_mode() {
+        let mut app = App::new(Mode::Unstaged, crate::app::View::Unified);
+        let file = FileChange {
+            path: "src/lib.rs".into(),
+            status: Status::Modified,
+            added: Some(1),
+            removed: Some(1),
+            index: ' ',
+            worktree: 'M',
+        };
+        app.apply_refresh(Refreshed {
+            mode: Mode::Unstaged,
+            target: Target {
+                scope: Scope::All,
+                workspace_id: None,
+                label: None,
+            },
+            groups: vec![RepoGroup {
+                root: "/r".into(),
+                name: "r".into(),
+                panes: Vec::new(),
+                stats: Ok(RepoStats {
+                    files: vec![file],
+                    ..Default::default()
+                }),
+            }],
+            non_repo_panes: 0,
+            herdr_error: None,
+        });
+        app.apply_diff(DiffResult {
+            root: "/r".into(),
+            mode: Mode::Unstaged,
+            path: "src/lib.rs".into(),
+            lines: Ok(parse_unified("@@ -1,2 +1,2 @@\n ctx\n-old\n+new\n")),
+            highlights: Vec::new(),
+        });
+        app.focus = crate::app::Focus::Diff;
+        let screen = render_app(app, 160, 20);
+        assert!(
+            screen.contains(" space: stage hunk  @@ -1,2 +1,2 @@"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn notice_shows_git_output() {
+        let mut app = app();
+        app.notice = Some(crate::app::Notice {
+            title: "git commit failed".into(),
+            body: "pre-commit hook failed:\nclippy found 2 warnings".into(),
+        });
+        let screen = render_app(app, 160, 30);
+        assert!(screen.contains("git commit failed"), "{screen}");
+        assert!(screen.contains("clippy found 2 warnings"), "{screen}");
     }
 
     #[test]

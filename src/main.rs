@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyEventKind, MouseEventKind,
 };
 use crossterm::execute;
 use serde_json::json;
@@ -50,6 +51,10 @@ struct Cli {
     /// Disable syntax highlighting
     #[arg(long)]
     no_highlight: bool,
+
+    /// Never write to git: no staging or committing, only viewing
+    #[arg(long)]
+    read_only: bool,
 
     /// Don't capture the mouse (keeps the terminal's own text selection)
     #[arg(long)]
@@ -175,6 +180,7 @@ fn main() -> Result<()> {
                 }),
                 me,
                 mouse: !cli.no_mouse,
+                read_only: cli.read_only,
             };
             run_tui(client, opts)
         }
@@ -300,11 +306,14 @@ struct TuiOpts {
     scope: Scope,
     me: SelfPane,
     mouse: bool,
+    read_only: bool,
 }
 
 /// Enter the TUI; mouse capture sits on top of ratatui's raw mode + alternate screen.
 fn init_terminal(mouse: bool) -> Result<ratatui::DefaultTerminal> {
     let terminal = ratatui::init();
+    // Paste arrives as one event, so a pasted commit message isn't typed key by key.
+    execute!(std::io::stdout(), EnableBracketedPaste)?;
     if mouse {
         execute!(std::io::stdout(), EnableMouseCapture)?;
     }
@@ -315,6 +324,7 @@ fn restore_terminal(mouse: bool) {
     if mouse {
         let _ = execute!(std::io::stdout(), DisableMouseCapture);
     }
+    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
 }
 
@@ -328,6 +338,7 @@ fn run_tui(client: Client, opts: TuiOpts) -> Result<()> {
         scope,
         me,
         mouse,
+        read_only,
     } = opts;
     let here_available = me.inside_herdr();
     let (job_tx, job_rx) = mpsc::channel::<Job>();
@@ -346,6 +357,7 @@ fn run_tui(client: Client, opts: TuiOpts) -> Result<()> {
     }
     let mut terminal = init_terminal(mouse)?;
     let mut app = App::new(mode, view).with_scope(scope, here_available);
+    app.read_only = read_only;
     job_tx.send(Job::Refresh { mode, scope })?;
     let refresh = |app: &App| Job::Refresh {
         mode: app.mode,
@@ -368,41 +380,53 @@ fn run_tui(client: Client, opts: TuiOpts) -> Result<()> {
             }
 
             if event::poll(Duration::from_millis(50))? {
-                match event::read()? {
-                    Event::Key(k) if k.kind != KeyEventKind::Release => {
-                        dirty = true;
-                        match app.on_key(k) {
-                            Action::None => {}
-                            Action::Quit => return Ok(()),
-                            Action::Refresh => job_tx.send(refresh(&app))?,
-                            Action::LoadDiff => request_diff(&app, &job_tx)?,
-                            Action::FocusPane(id) => match client.focus_pane(&id) {
-                                Ok(()) => app.flash(format!("focused {id}")),
-                                Err(e) => app.flash(format!("focus failed: {e:#}")),
-                            },
-                            Action::OpenEditor { path, line } => {
-                                restore_terminal(mouse);
-                                let res = open_editor(&path, line);
-                                terminal = init_terminal(mouse)?;
-                                terminal.clear()?;
-                                if let Err(e) = res {
-                                    app.flash(format!("editor: {e:#}"));
-                                }
-                                job_tx.send(refresh(&app))?;
-                            }
-                        }
-                    }
+                let action = match event::read()? {
+                    Event::Key(k) if k.kind != KeyEventKind::Release => Some(app.on_key(k)),
                     // Pointer motion arrives constantly; only real input needs work.
                     Event::Mouse(m) if !matches!(m.kind, MouseEventKind::Moved) => {
-                        dirty = true;
-                        match app.on_mouse(m) {
-                            Action::Refresh => job_tx.send(refresh(&app))?,
-                            Action::LoadDiff => request_diff(&app, &job_tx)?,
-                            _ => {}
+                        Some(app.on_mouse(m))
+                    }
+                    Event::Paste(text) => {
+                        app.on_paste(&text);
+                        Some(Action::None)
+                    }
+                    Event::Resize(..) => Some(Action::None),
+                    _ => None,
+                };
+                if let Some(action) = action {
+                    dirty = true;
+                    match action {
+                        Action::None => {}
+                        Action::Quit => return Ok(()),
+                        Action::Refresh => job_tx.send(refresh(&app))?,
+                        Action::LoadDiff => request_diff(&app, &job_tx)?,
+                        Action::FocusPane(id) => match client.focus_pane(&id) {
+                            Ok(()) => app.flash(format!("focused {id}")),
+                            Err(e) => app.flash(format!("focus failed: {e:#}")),
+                        },
+                        Action::Git { root, op } => job_tx.send(Job::Git { root, op })?,
+                        Action::OpenEditor { path, line } => {
+                            restore_terminal(mouse);
+                            let res = open_editor(&path, line);
+                            terminal = init_terminal(mouse)?;
+                            terminal.clear()?;
+                            if let Err(e) = res {
+                                app.flash(format!("editor: {e:#}"));
+                            }
+                            job_tx.send(refresh(&app))?;
+                        }
+                        Action::ExternalCommit { root } => {
+                            restore_terminal(mouse);
+                            let res = external_commit(&root);
+                            terminal = init_terminal(mouse)?;
+                            terminal.clear()?;
+                            match res {
+                                Ok(()) => app.flash("git commit finished"),
+                                Err(e) => app.flash(format!("git commit: {e:#}")),
+                            }
+                            job_tx.send(refresh(&app))?;
                         }
                     }
-                    Event::Resize(..) => dirty = true,
-                    _ => {}
                 }
             }
 
@@ -416,6 +440,11 @@ fn run_tui(client: Client, opts: TuiOpts) -> Result<()> {
                     }
                     AppEvent::Diff(d) => {
                         app.apply_diff(d);
+                        dirty = true;
+                    }
+                    AppEvent::GitDone(done) => {
+                        app.apply_git_done(done);
+                        job_tx.send(refresh(&app))?;
                         dirty = true;
                     }
                     // Focus only matters when the scope depends on it.
@@ -447,6 +476,23 @@ fn run_tui(client: Client, opts: TuiOpts) -> Result<()> {
 
     restore_terminal(mouse);
     result
+}
+
+/// Plain `git commit` in the real terminal, for editors, templates and signing prompts.
+/// On failure, wait for Enter so git's output can be read before the TUI comes back.
+fn external_commit(root: &std::path::Path) -> Result<()> {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .arg("commit")
+        .status()?;
+    if !status.success() {
+        use std::io::BufRead as _;
+        eprintln!("\ngit commit exited with {status}. Press Enter to return to herdiff.");
+        let _ = std::io::stdin().lock().read_line(&mut String::new());
+        anyhow::bail!("exited with {status}");
+    }
+    Ok(())
 }
 
 fn request_diff(app: &App, jobs: &mpsc::Sender<Job>) -> Result<()> {

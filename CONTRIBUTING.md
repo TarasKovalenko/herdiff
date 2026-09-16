@@ -56,8 +56,10 @@ The git tests build throwaway repos in a temp directory, so they never touch you
 - `git.rs` is the only module that runs git and `herdr.rs` the only one that talks to
   the socket. `app.rs` holds state and key handling, `ui.rs` only draws. Keep it that way.
 - Git and socket calls stay off the UI thread. Add work to `worker.rs`.
-- Never drop `GIT_OPTIONAL_LOCKS=0` or add a git command that writes. herdiff must not
-  take `index.lock` while an agent is committing.
+- Reads keep `GIT_OPTIONAL_LOCKS=0`: refreshing must never take `index.lock` while an
+  agent is committing. Git writes go through `git::apply_op`, run only on an explicit key
+  press, are blocked by `--read-only`, and never delete a lock. Don't add anything that
+  pushes, amends or discards work.
 - New behaviour comes with tests. Rendering is tested against ratatui's `TestBackend`
   at several sizes, down to 40×12.
 - A new key goes in the help screen (`ui.rs`) and the README key table.

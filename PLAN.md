@@ -54,6 +54,36 @@ Known gaps: herdr has one focus per server, so with several clients follow track
 moved last. A pane moved to another workspace gets a new ID its process never learns, so
 herdiff stops recognising its own pane until restarted.
 
+## Stage and commit
+
+Writes on by default, `--read-only` turns them off. File state comes from
+`git status --porcelain=v1 -z --no-renames` (X = staged, Y = unstaged) in every mode, plus
+a staged-file count for the commit box.
+
+- File: `git add -A -- path` / `git restore --staged -- path` (`git rm --cached` without a
+  HEAD). The action depends on mode and state: staged mode unstages, otherwise stage what's
+  left and unstage when nothing is.
+- Hunk: the UI sends the file, the hunk's index and its `@@` line. The worker re-runs the
+  diff, cuts that hunk out of git's raw bytes (`git::hunk_patch`, so non-UTF-8 content and
+  tabs survive), refuses if the `@@` line no longer matches what was on screen, and pipes
+  it to `git apply --cached`, `--reverse` to unstage. All diffs pin `--src-prefix=a/
+  --dst-prefix=b/ --no-textconv --no-relative` so user config can't produce a patch
+  `git apply` rejects. Only in unstaged mode (the patch's old side
+  is the index) and staged mode (new side is the index). In uncommitted and branch modes
+  a hunk mixes both, so it's refused with a hint to switch.
+- Commit: `git commit -F -` with the message on stdin, hooks included. Writes run in their
+  own session (`setsid`, no `GPG_TTY`), so nothing can prompt on the terminal the TUI owns;
+  a passphrase prompt or interactive hook fails fast with a hint. `C` suspends the TUI and
+  runs interactive `git commit` for editors, signing and such hooks.
+- Without a HEAD, unstaging uses `git rm -r -f --cached` (`-f` only overrides the safety
+  check for files edited after staging; `--cached` keeps the working tree untouched).
+
+Writes are `Job::Git` in the worker. They're never coalesced, run in order before the reads
+in the same batch, and report `GitDone`; the UI always refreshes afterwards. If
+`index.lock` is held, a write retries 10 × 150ms, then fails with a hint, and never
+removes the lock. While a commit runs, the commit box ignores input; on failure the
+message stays and the output shows in a notice.
+
 ## herdr plugin
 
 herdiff ships as a [herdr plugin](https://herdr.dev/docs/plugins/) through

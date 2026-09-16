@@ -17,6 +17,7 @@ pub struct DiffLine {
     pub kind: LineKind,
     pub old_no: Option<u32>,
     pub new_no: Option<u32>,
+    /// Display text: without the `+`/`-`/` ` prefix, tabs expanded, no trailing `\r`.
     pub text: String,
 }
 
@@ -26,40 +27,37 @@ pub fn parse_unified(input: &str) -> Vec<DiffLine> {
     let mut new_no = 0u32;
     let mut in_hunk = false;
 
-    for raw in input.lines() {
+    for raw in input.split_terminator('\n') {
+        let shown = raw.strip_suffix('\r').unwrap_or(raw);
         if raw.starts_with("@@") {
             if let Some((o, n)) = parse_hunk_header(raw) {
                 old_no = o;
                 new_no = n;
                 in_hunk = true;
             }
-            out.push(line(LineKind::Hunk, None, None, raw));
+            out.push(line(LineKind::Hunk, None, None, shown));
             continue;
         }
         if raw.starts_with("diff --git") {
             in_hunk = false;
         }
         if !in_hunk {
-            out.push(line(LineKind::Meta, None, None, raw));
+            out.push(line(LineKind::Meta, None, None, shown));
             continue;
         }
+        let body = shown.get(1..).unwrap_or("");
         match raw.as_bytes().first() {
             Some(b'+') => {
-                out.push(line(LineKind::Added, None, Some(new_no), &raw[1..]));
+                out.push(line(LineKind::Added, None, Some(new_no), body));
                 new_no += 1;
             }
             Some(b'-') => {
-                out.push(line(LineKind::Removed, Some(old_no), None, &raw[1..]));
+                out.push(line(LineKind::Removed, Some(old_no), None, body));
                 old_no += 1;
             }
-            Some(b'\\') => out.push(line(LineKind::NoNewline, None, None, raw)),
+            Some(b'\\') => out.push(line(LineKind::NoNewline, None, None, shown)),
             Some(b' ') => {
-                out.push(line(
-                    LineKind::Context,
-                    Some(old_no),
-                    Some(new_no),
-                    &raw[1..],
-                ));
+                out.push(line(LineKind::Context, Some(old_no), Some(new_no), body));
                 old_no += 1;
                 new_no += 1;
             }
@@ -71,11 +69,37 @@ pub fn parse_unified(input: &str) -> Vec<DiffLine> {
             }
             _ => {
                 in_hunk = false;
-                out.push(line(LineKind::Meta, None, None, raw));
+                out.push(line(LineKind::Meta, None, None, shown));
             }
         }
     }
     out
+}
+
+/// Index of the hunk header that line `at` belongs to: the one at or above it, or the first
+/// hunk when `at` is still in the file header. This is the hunk `space` stages.
+pub fn hunk_start(lines: &[DiffLine], at: usize) -> Option<usize> {
+    let at = at.min(lines.len().checked_sub(1)?);
+    let start = (0..=at)
+        .rev()
+        .find(|&i| lines[i].kind == LineKind::Hunk)
+        .or_else(|| (at..lines.len()).find(|&i| lines[i].kind == LineKind::Hunk))?;
+    if start < at
+        && lines[start + 1..=at]
+            .iter()
+            .any(|l| l.kind == LineKind::Meta)
+    {
+        return None; // `at` is past the hunk, in another file's header
+    }
+    Some(start)
+}
+
+/// How many hunks come before line `start` (the hunk's position in its diff).
+pub fn hunk_index(lines: &[DiffLine], start: usize) -> usize {
+    lines[..start.min(lines.len())]
+        .iter()
+        .filter(|l| l.kind == LineKind::Hunk)
+        .count()
 }
 
 /// One screen row of a diff view, referencing indices into the parsed lines.
@@ -235,6 +259,19 @@ index 1..2 100644
         let unified = Rows::unified(&lines);
         assert_eq!(unified.rows.len(), lines.len());
         assert_eq!(unified.line_row[8], 8);
+    }
+
+    #[test]
+    fn hunk_start_and_index() {
+        let lines = parse_unified(
+            "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+A\n@@ -9 +9 @@\n-y\n+Y\n",
+        );
+        assert_eq!(hunk_start(&lines, 0), Some(3)); // file header: first hunk
+        assert_eq!(hunk_start(&lines, 5), Some(3));
+        assert_eq!(hunk_start(&lines, 8), Some(6));
+        assert_eq!(hunk_index(&lines, 6), 1);
+        assert_eq!(lines[4].text, "a");
+        assert!(hunk_start(&parse_unified("Binary files differ\n"), 0).is_none());
     }
 
     #[test]

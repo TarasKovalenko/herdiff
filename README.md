@@ -9,13 +9,16 @@ A terminal diff viewer for [herdr](https://herdr.dev). It finds every git repo y
 panes are sitting in and shows what changed, grouped by repo, while your agents keep
 editing. Leave it open in a side pane and you can watch the work land.
 
-Diffs are syntax highlighted and switch to a side-by-side layout when there's room.
+Diffs are syntax highlighted and switch to a side-by-side layout when there's room. When
+you like what you see, stage it (whole files or single hunks) and commit without leaving
+the viewer.
 
 <img src="docs/screenshots/split.svg" alt="herdiff following the payments workspace: two agents on one repo, and a side-by-side, syntax-highlighted Rust diff">
 
 | | |
 | --- | --- |
-| <img src="docs/screenshots/unified.svg" alt="Every workspace at once on a narrower terminal: three repos with their agents and a unified TypeScript diff"> | <img src="docs/screenshots/help.svg" alt="The key help overlay"> |
+| <img src="docs/screenshots/unified.svg" alt="Every workspace at once on a narrower terminal: three repos with their agents and a unified TypeScript diff"> | <img src="docs/screenshots/commit.svg" alt="Two files staged and the commit message box open, warning that claude is still working in the repo"> |
+| <img src="docs/screenshots/help.svg" alt="The key help overlay"> | |
 
 ## Install
 
@@ -72,6 +75,7 @@ herdiff --scope all       # every workspace instead of the one you're in
 herdiff -d ~/src/other    # also show a repo that has no herdr pane
 herdiff --view split      # always side-by-side (auto, unified, split)
 herdiff --theme Nord      # pick a highlighting theme
+herdiff --read-only       # view only: no staging, no commits
 herdiff list --json       # print once and exit, handy for scripts
 ```
 
@@ -123,6 +127,38 @@ second one over SSH), follow tracks whichever client moved last. If you move her
 pane to another workspace, restart it: the pane gets a new ID that the running process
 never sees.
 
+## Stage and commit
+
+The Files panel shows two status columns, like `git status -s`: the green one is what's
+staged, the red one what isn't. `MM` means part of the file is staged. The title counts
+staged files.
+
+- `space` on a file stages it, or unstages it once nothing is left to stage. In staged
+  mode it unstages.
+- `space` in the diff panel stages the marked hunk (the one at the top of the view; `n`
+  and `N` move between hunks). This works in unstaged mode, and in staged mode it
+  unstages the hunk. In the other modes a hunk mixes staged and unstaged lines, so switch
+  with `m` first.
+- `A` stages everything, `R` unstages everything.
+- `c` opens a commit box for the staged changes. The first line is the subject. `ctrl-s`
+  commits, `esc` cancels. Your hooks run; if one fails, its output shows up and the message
+  is kept for another try.
+- `C` runs plain `git commit` in the terminal instead, for commit templates, `--verbose` or
+  signing prompts, and brings herdiff back when it's done. The inline commit runs without a
+  terminal, so if signing asks for a passphrase or a hook wants to ask you something, it
+  fails straight away and tells you to use `C`.
+
+Agents may be working in the same repo, so a few things behave carefully:
+
+- The commit box warns when an agent in that repo is still `working`, since you might
+  commit half of its change.
+- Staging and committing need git's `index.lock`. If an agent's git holds it, herdiff
+  retries for about a second and a half, then tells you. It never deletes the lock.
+- Only these keys write. The background refresh stays read-only.
+- herdiff doesn't push, amend or discard anything.
+
+Start with `--read-only` to turn all of this off.
+
 ## Modes
 
 Press `m` to cycle through them.
@@ -139,9 +175,13 @@ Press `m` to cycle through them.
 | `tab` `l` `enter` / `shift-tab` `h` `esc` | next / previous panel |
 | `j` `k` | move the selection, or scroll when the diff has focus |
 | `[` `]` | previous / next file |
-| `J` `K`, `space` `b`, `ctrl-d` `ctrl-u`, `g` `G` | scroll the diff |
+| `J` `K`, `f` `b`, `ctrl-d` `ctrl-u`, `g` `G` | scroll the diff |
 | `n` `N` | next / previous hunk |
 | `H` `L` | scroll sideways |
+| `space` | stage or unstage the selected file, or the marked hunk in the diff |
+| `A` `R` | stage all / unstage all |
+| `c` | commit staged changes (`ctrl-s` commits, `esc` cancels) |
+| `C` | run `git commit` in the terminal |
 | `s` | toggle side-by-side / unified |
 | `w` | switch scope: follow, here, all |
 | `m` | switch mode |
@@ -164,9 +204,9 @@ the UI. Old and new sides are highlighted as separate streams, which keeps a com
 string opened in a removed line from bleeding into the added ones. Files over 10,000 diff
 lines are shown plain.
 
-All diffs come from the `git` CLI, so your git config and worktrees behave as usual. Every
-git call runs with `GIT_OPTIONAL_LOCKS=0`. That way herdiff never grabs `index.lock` while
-an agent is trying to commit.
+All diffs come from the `git` CLI, so your git config and worktrees behave as usual.
+Refreshes run with `GIT_OPTIONAL_LOCKS=0`, so watching a repo never takes `index.lock`
+while an agent is trying to commit. Only the stage and commit keys take the lock.
 
 Nested repos inside a repo (agent worktrees under `.claude/worktrees/`, for example) show
 up as one entry marked `repo`. Open them with `-d` if you want their diffs.
