@@ -61,6 +61,17 @@ The git tests build throwaway repos in a temp directory, so they never touch you
 - New behaviour comes with tests. Rendering is tested against ratatui's `TestBackend`
   at several sizes, down to 40×12.
 - A new key goes in the help screen (`ui.rs`) and the README key table.
+- The icon and social preview live in `docs/brand/` as SVG sources. The social preview
+  embeds `docs/screenshots/split.svg`, so re-export the PNGs after regenerating
+  screenshots or editing the SVGs (any headless Chrome works; on macOS):
+
+  ```sh
+  chrome="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+  "$chrome" --headless=new --hide-scrollbars --default-background-color=00000000 \
+    --window-size=512,512 --screenshot="$PWD/docs/brand/icon.png" "file://$PWD/docs/brand/icon.svg"
+  "$chrome" --headless=new --hide-scrollbars --allow-file-access-from-files \
+    --window-size=1280,640 --screenshot="$PWD/docs/brand/social.png" "file://$PWD/docs/brand/social.svg"
+  ```
 - If the layout changes, regenerate the screenshots with `cargo run --example screenshots`.
   It builds throwaway demo repos and a fake herdr session, so it needs no herdr and never
   shows your own work.

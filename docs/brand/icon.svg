@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <title>herdiff</title>
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#232634"/>
+      <stop offset="1" stop-color="#12131a"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Terminal tile -->
+  <rect x="16" y="16" width="480" height="480" rx="108" fill="url(#tile)"/>
+  <rect x="17.5" y="17.5" width="477" height="477" rx="106.5" fill="none" stroke="#ffffff" stroke-opacity="0.14" stroke-width="3"/>
+
+  <!-- Pane frame, as the focused diff panel is drawn -->
+  <rect x="84" y="100" width="344" height="312" rx="22" fill="none" stroke="#7dcfff" stroke-width="10"/>
+  <line x1="256" y1="126" x2="256" y2="386" stroke="#7dcfff" stroke-opacity="0.55" stroke-width="6" stroke-linecap="round"/>
+
+  <!-- Old side: context and removed rows -->
+  <rect x="112" y="136" width="116" height="26" rx="13" fill="#636a86"/>
+  <rect x="104" y="184" width="132" height="42" rx="10" fill="#3a1a20"/>
+  <path d="M116 205h18" stroke="#f7768e" stroke-width="7" stroke-linecap="round"/>
+  <rect x="144" y="196" width="80" height="18" rx="9" fill="#f7768e"/>
+  <rect x="104" y="240" width="132" height="42" rx="10" fill="#3a1a20"/>
+  <path d="M116 261h18" stroke="#f7768e" stroke-width="7" stroke-linecap="round"/>
+  <rect x="144" y="252" width="56" height="18" rx="9" fill="#f7768e"/>
+  <rect x="112" y="300" width="96" height="26" rx="13" fill="#636a86"/>
+
+  <!-- New side: context and added rows -->
+  <rect x="284" y="136" width="116" height="26" rx="13" fill="#636a86"/>
+  <rect x="276" y="184" width="132" height="42" rx="10" fill="#17331f"/>
+  <path d="M297 196v18M288 205h18" stroke="#9ece6a" stroke-width="7" stroke-linecap="round"/>
+  <rect x="316" y="196" width="80" height="18" rx="9" fill="#9ece6a"/>
+  <rect x="276" y="240" width="132" height="42" rx="10" fill="#17331f"/>
+  <path d="M297 252v18M288 261h18" stroke="#9ece6a" stroke-width="7" stroke-linecap="round"/>
+  <rect x="316" y="252" width="64" height="18" rx="9" fill="#9ece6a"/>
+  <rect x="276" y="300" width="132" height="42" rx="10" fill="#17331f"/>
+  <path d="M297 312v18M288 321h18" stroke="#9ece6a" stroke-width="7" stroke-linecap="round"/>
+  <rect x="316" y="312" width="72" height="18" rx="9" fill="#9ece6a"/>
+
+  <!-- Hoof print: the herd -->
+  <!-- Dark outline separates it from the pane frame it overlaps. -->
+  <g fill="#e0af68" stroke="#15161c" stroke-width="12" stroke-linejoin="round" paint-order="stroke" transform="translate(386 390) rotate(-18)">
+    <path d="M-7 -54C-26 -40 -42 -8 -40 16C-38 36 -24 44 -11 40C-2 37 -1 28 -2 18Z"/>
+    <path d="M7 -54C26 -40 42 -8 40 16C38 36 24 44 11 40C2 37 1 28 2 18Z"/>
+  </g>
+</svg>

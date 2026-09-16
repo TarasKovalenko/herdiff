@@ -1,5 +1,7 @@
 # herdiff
 
+<img src="docs/brand/icon.svg" alt="herdiff icon: a side-by-side diff pane with a hoof print" width="112" align="right">
+
 [![ci](https://github.com/TarasKovalenko/herdiff/actions/workflows/ci.yml/badge.svg)](https://github.com/TarasKovalenko/herdiff/actions/workflows/ci.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
