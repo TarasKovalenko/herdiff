@@ -115,19 +115,27 @@ fn draw_repos(f: &mut Frame, app: &App, area: Rect) -> usize {
             match &g.stats {
                 Ok(s) => {
                     let (a, r) = s.totals();
-                    head.push(Span::styled(
-                        format!(" {} ", s.branch),
-                        Style::new().fg(Color::Magenta),
-                    ));
-                    if s.files.is_empty() {
-                        head.push(Span::styled("clean", Style::new().fg(DIM)));
+                    let tail: Vec<Span> = if s.files.is_empty() {
+                        vec![Span::styled("clean", Style::new().fg(DIM))]
                     } else {
-                        head.push(Span::styled(
+                        let mut t = vec![Span::styled(
                             format!("{}f ", s.files.len()),
                             Style::new().fg(DIM),
-                        ));
-                        head.extend(counts(Some(a), Some(r)));
-                    }
+                        )];
+                        t.extend(counts(Some(a), Some(r)));
+                        t
+                    };
+                    // The counts matter more than the branch: shorten the branch to fit.
+                    let used =
+                        2 + g.name.width() + tail.iter().map(|s| s.content.width()).sum::<usize>();
+                    let room = width.saturating_sub(used + 2);
+                    let branch = if room >= 4 {
+                        format!(" {} ", truncate(&s.branch, room))
+                    } else {
+                        " ".into()
+                    };
+                    head.push(Span::styled(branch, Style::new().fg(Color::Magenta)));
+                    head.extend(tail);
                 }
                 Err(_) => head.push(Span::styled(" git error", Style::new().fg(DEL_FG))),
             }
@@ -570,22 +578,21 @@ fn draw_help(f: &mut Frame) {
         ("n N", "next / previous hunk"),
         ("H L", "scroll diff horizontally"),
         ("s", "toggle side-by-side / unified view"),
-        (
-            "w",
-            "scope: all → follow focused workspace → here (herdiff's own)",
-        ),
+        ("w", "cycle scope: all → follow focus → here"),
         ("m", "cycle mode: uncommitted → unstaged → staged → branch"),
         ("r", "refresh now"),
-        ("a", "focus repo's agent pane in herdr (repeat to cycle)"),
+        ("a", "jump to the repo's agent pane (repeat to cycle)"),
         ("e", "open file in $EDITOR at change"),
         (
             "mouse",
-            "wheel scrolls, click selects; shift+wheel scrolls sideways",
+            "wheel scrolls, click selects, shift+wheel sideways",
         ),
         ("q / ctrl-c", "quit"),
     ];
     let area = f.area();
-    let w = 80.min(area.width);
+    // Fit the longest line: 1 pad + 21 key column + description + 2 borders + 1 spare.
+    let longest = KEYS.iter().map(|(_, d)| d.width()).max().unwrap_or(0);
+    let w = ((longest + 25) as u16).min(area.width);
     let h = (KEYS.len() as u16 + 4).min(area.height);
     let rect = Rect::new((area.width - w) / 2, (area.height - h) / 2, w, h);
     let lines: Vec<Line> = KEYS
@@ -755,6 +762,32 @@ mod tests {
         });
         let screen = render_app(app, 160, 40);
         assert!(screen.contains("ENDMARK"), "{screen}");
+    }
+
+    #[test]
+    fn help_lines_are_not_cut_off() {
+        let mut app = app();
+        app.show_help = true;
+        let screen = render_app(app, 160, 40);
+        for text in [
+            "cycle scope: all → follow focus → here",
+            "wheel scrolls, click selects, shift+wheel sideways",
+            "cycle mode: uncommitted → unstaged → staged → branch",
+        ] {
+            assert!(screen.contains(text), "{text}\n{screen}");
+        }
+    }
+
+    #[test]
+    fn long_branch_is_shortened_before_counts() {
+        let mut app = app();
+        if let Ok(stats) = &mut app.groups[0].stats {
+            stats.branch = "feature/a-very-long-branch-name-that-does-not-fit".into();
+        }
+        let screen = render_app(app, 160, 30);
+        let header = screen.lines().find(|l| l.contains("proj ")).expect(&screen);
+        assert!(header.contains("+1 -1"), "{header}");
+        assert!(header.contains('…'), "{header}");
     }
 
     #[test]

@@ -9,6 +9,12 @@ editing. Leave it open in a side pane and you can watch the work land.
 
 Diffs are syntax highlighted and switch to a side-by-side layout when there's room.
 
+<img src="docs/screenshots/split.svg" alt="herdiff following the payments workspace: two agents on one repo, and a side-by-side, syntax-highlighted Rust diff">
+
+| | |
+| --- | --- |
+| <img src="docs/screenshots/unified.svg" alt="Every workspace at once on a narrower terminal: three repos with their agents and a unified TypeScript diff"> | <img src="docs/screenshots/help.svg" alt="The key help overlay"> |
+
 ## Install
 
 herdiff runs on macOS and Linux and needs `git` on your `PATH`. Both install routes

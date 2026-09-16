@@ -1,13 +1,3 @@
-mod app;
-mod diff;
-mod git;
-mod herdr;
-mod highlight;
-mod model;
-mod scope;
-mod ui;
-mod worker;
-
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc;
@@ -21,11 +11,12 @@ use crossterm::event::{
 use crossterm::execute;
 use serde_json::json;
 
-use app::{Action, App, View};
-use git::Mode;
-use herdr::Client;
-use scope::{Scope, SelfPane};
-use worker::{AppEvent, Job};
+use herdiff::app::{Action, App, View};
+use herdiff::git::Mode;
+use herdiff::herdr::Client;
+use herdiff::scope::{Scope, SelfPane};
+use herdiff::worker::{self, AppEvent, Job};
+use herdiff::{highlight, ui};
 
 /// Live diff viewer for the git repos your herdr agents are working in.
 #[derive(Parser)]

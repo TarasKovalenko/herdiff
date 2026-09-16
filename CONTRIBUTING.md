@@ -61,6 +61,9 @@ The git tests build throwaway repos in a temp directory, so they never touch you
 - New behaviour comes with tests. Rendering is tested against ratatui's `TestBackend`
   at several sizes, down to 40×12.
 - A new key goes in the help screen (`ui.rs`) and the README key table.
+- If the layout changes, regenerate the screenshots with `cargo run --example screenshots`.
+  It builds throwaway demo repos and a fake herdr session, so it needs no herdr and never
+  shows your own work.
 - `herdr-plugin.toml` follows [herdr's plugin docs](https://herdr.dev/docs/plugins/). Its
   `name` and `version` must match `Cargo.toml` (a test checks this). If you start using a
   newer herdr API, raise `min_herdr_version`.
