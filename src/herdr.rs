@@ -20,6 +20,10 @@ pub struct Snapshot {
     pub tabs: Vec<Tab>,
     #[serde(default)]
     pub panes: Vec<Pane>,
+    #[serde(default)]
+    pub focused_workspace_id: Option<String>,
+    #[serde(default)]
+    pub focused_pane_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -154,6 +158,9 @@ impl Client {
             "pane.moved",
             "pane.exited",
             "pane.agent_detected",
+            "workspace.focused",
+            "tab.focused",
+            "pane.focused",
         ];
         let mut subs: Vec<Value> = TOPOLOGY.iter().map(|t| json!({ "type": t })).collect();
         subs.extend(

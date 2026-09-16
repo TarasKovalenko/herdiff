@@ -1,14 +1,17 @@
 //! Application state and input handling.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::{Position, Rect};
 
 use crate::diff::{DiffLine, LineKind, Rows};
 use crate::git::{FileChange, Mode};
 use crate::highlight::Highlights;
 use crate::model::RepoGroup;
+use crate::scope::{Scope, Target};
 use crate::worker::{DiffResult, Refreshed};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +72,30 @@ impl DiffView {
     }
 }
 
+/// Selection remembered per scope target, restored when you come back to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Saved {
+    root: PathBuf,
+    path: Option<String>,
+    scroll: usize,
+    hscroll: usize,
+}
+
+/// Panel rectangles and list offsets from the last frame, for mouse hit-testing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HitMap {
+    pub repos: Rect,
+    pub files: Rect,
+    pub diff: Rect,
+    pub repos_offset: usize,
+    pub files_offset: usize,
+}
+
+/// Rows moved per mouse wheel notch in the diff.
+const WHEEL_ROWS: isize = 3;
+/// Columns moved per horizontal wheel notch.
+const WHEEL_COLS: isize = 8;
+
 /// Side effects the main loop must perform after handling input.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
@@ -98,7 +125,17 @@ pub struct App {
     /// Inner width of the diff panel, set by the renderer (for `View::Auto`).
     pub diff_width: usize,
     pub view: View,
+    pub scope: Scope,
+    /// Resolved scope of the data on screen; `None` until the first refresh.
+    pub target: Option<Target>,
+    /// Whether `Scope::Here` makes sense (herdiff runs inside a herdr pane).
+    pub here_available: bool,
     agent_cycle: usize,
+    saved: HashMap<String, Saved>,
+    /// Scroll to restore once the diff of a remembered file arrives.
+    pending_scroll: Option<Saved>,
+    /// Set by the renderer every frame.
+    pub hit: HitMap,
 }
 
 impl App {
@@ -119,8 +156,20 @@ impl App {
             diff_height: 20,
             diff_width: 80,
             view,
+            scope: Scope::All,
+            target: None,
+            here_available: false,
             agent_cycle: 0,
+            saved: HashMap::new(),
+            pending_scroll: None,
+            hit: HitMap::default(),
         }
+    }
+
+    pub fn with_scope(mut self, scope: Scope, here_available: bool) -> Self {
+        self.scope = scope;
+        self.here_available = here_available;
+        self
     }
 
     pub fn repo(&self) -> Option<&RepoGroup> {
@@ -153,11 +202,49 @@ impl App {
     /// Apply refreshed data, preserving selection by repo root and file path.
     /// Returns true when the selected file's diff should be (re)loaded.
     pub fn apply_refresh(&mut self, r: Refreshed) -> bool {
-        if r.mode != self.mode {
-            return false; // stale result from before a mode switch
+        if r.mode != self.mode || r.target.scope != self.scope {
+            return false; // stale result from before a mode or scope switch
         }
-        let prev_root = self.repo().map(|g| g.root.clone());
-        let prev_file = self.file().cloned();
+        let mut prev_root = self.repo().map(|g| g.root.clone());
+        let mut prev_path = self.file().map(|f| f.path.clone());
+
+        let new_key = r.target.key();
+        let old_key = self.target.as_ref().map(Target::key);
+        if old_key.as_ref() != Some(&new_key) {
+            // Scope moved to another workspace: park this selection, restore that one's.
+            if let (Some(old), Some(root)) = (old_key, prev_root.clone()) {
+                // The loaded diff if it's the selected file; otherwise a restore that was
+                // still waiting for its diff when focus moved on again.
+                let (scroll, hscroll) = self
+                    .diff
+                    .as_ref()
+                    .filter(|v| v.root == root && Some(&v.path) == prev_path.as_ref())
+                    .map(|v| (v.scroll, v.hscroll))
+                    .or_else(|| {
+                        self.pending_scroll
+                            .as_ref()
+                            .filter(|p| p.root == root && p.path == prev_path)
+                            .map(|p| (p.scroll, p.hscroll))
+                    })
+                    .unwrap_or_default();
+                let saved = Saved {
+                    root,
+                    path: prev_path.clone(),
+                    scroll,
+                    hscroll,
+                };
+                self.saved.insert(old, saved);
+            }
+            let restore = self.saved.get(&new_key).cloned();
+            prev_root = restore.as_ref().map(|s| s.root.clone());
+            prev_path = restore.as_ref().and_then(|s| s.path.clone());
+            self.pending_scroll = restore;
+            self.diff = None;
+            self.repo_idx = 0;
+            self.file_idx = 0;
+            self.agent_cycle = 0;
+        }
+        self.target = Some(r.target);
 
         self.groups = r.groups;
         self.non_repo_panes = r.non_repo_panes;
@@ -169,9 +256,9 @@ impl App {
             .and_then(|root| self.groups.iter().position(|g| g.root == root))
             .unwrap_or(self.repo_idx)
             .min(self.groups.len().saturating_sub(1));
-        self.file_idx = prev_file
+        self.file_idx = prev_path
             .as_ref()
-            .and_then(|f| self.files().iter().position(|x| x.path == f.path))
+            .and_then(|p| self.files().iter().position(|x| &x.path == p))
             .unwrap_or(self.file_idx)
             .min(self.files().len().saturating_sub(1));
 
@@ -200,7 +287,12 @@ impl App {
             .filter(|v| v.root == d.root && v.path == d.path && v.mode == d.mode)
             .map(|v| (v.scroll, v.hscroll));
         let line_count = d.lines.as_ref().map(|l| l.len()).unwrap_or(0);
-        let (scroll, hscroll) = match keep_scroll {
+        let restored = self
+            .pending_scroll
+            .take()
+            .filter(|s| s.root == d.root && s.path.as_deref() == Some(d.path.as_str()))
+            .map(|s| (s.scroll, s.hscroll));
+        let (scroll, hscroll) = match keep_scroll.or(restored) {
             Some((s, h)) => (s.min(line_count.saturating_sub(1)), h),
             None => (first_change(&d.lines), 0),
         };
@@ -269,6 +361,12 @@ impl App {
                 self.flash(format!("mode: {}", self.mode.label()));
                 Action::Refresh
             }
+            KeyCode::Char('w') => {
+                self.scope = self.scope.next(self.here_available);
+                self.loading = true;
+                self.flash(format!("scope: {}", self.scope.label()));
+                Action::Refresh
+            }
             KeyCode::Char('r') => {
                 self.loading = true;
                 Action::Refresh
@@ -290,6 +388,85 @@ impl App {
             KeyCode::Char('e') => self.open_editor(),
             _ => Action::None,
         }
+    }
+
+    pub fn on_mouse(&mut self, ev: MouseEvent) -> Action {
+        if self.show_help {
+            if matches!(ev.kind, MouseEventKind::Down(_)) {
+                self.show_help = false;
+            }
+            return Action::None;
+        }
+        let pos = Position::new(ev.column, ev.row);
+        let shift = ev.modifiers.contains(KeyModifiers::SHIFT);
+        let panel = if self.hit.repos.contains(pos) {
+            Focus::Repos
+        } else if self.hit.files.contains(pos) {
+            Focus::Files
+        } else if self.hit.diff.contains(pos) {
+            Focus::Diff
+        } else {
+            return Action::None;
+        };
+        match ev.kind {
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                let dir = if ev.kind == MouseEventKind::ScrollDown {
+                    1
+                } else {
+                    -1
+                };
+                match panel {
+                    Focus::Repos => self.select_repo(self.repo_idx as isize + dir),
+                    Focus::Files => self.select_file(self.file_idx as isize + dir),
+                    Focus::Diff if shift => self.hscroll(dir * WHEEL_COLS),
+                    Focus::Diff => self.scroll_diff(dir * WHEEL_ROWS),
+                }
+            }
+            MouseEventKind::ScrollRight if panel == Focus::Diff => self.hscroll(WHEEL_COLS),
+            MouseEventKind::ScrollLeft if panel == Focus::Diff => self.hscroll(-WHEEL_COLS),
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.focus = panel;
+                match panel {
+                    Focus::Repos => match self.repo_at(ev.row) {
+                        Some(i) => self.select_repo(i as isize),
+                        None => Action::None,
+                    },
+                    Focus::Files => match self.file_at(ev.row) {
+                        Some(i) => self.select_file(i as isize),
+                        None => Action::None,
+                    },
+                    Focus::Diff => Action::None,
+                }
+            }
+            _ => Action::None,
+        }
+    }
+
+    /// Repo under screen row `y`. Each repo takes one row plus one per pane.
+    fn repo_at(&self, y: u16) -> Option<usize> {
+        let inner = y.checked_sub(self.hit.repos.y + 1)? as usize;
+        if y + 1 >= self.hit.repos.bottom() {
+            return None; // bottom border
+        }
+        let mut top = 0;
+        for (i, g) in self.groups.iter().enumerate().skip(self.hit.repos_offset) {
+            let height = 1 + g.panes.len();
+            if inner < top + height {
+                return Some(i);
+            }
+            top += height;
+        }
+        None
+    }
+
+    /// File under screen row `y`.
+    fn file_at(&self, y: u16) -> Option<usize> {
+        let inner = y.checked_sub(self.hit.files.y + 1)? as usize;
+        if y + 1 >= self.hit.files.bottom() {
+            return None;
+        }
+        let i = self.hit.files_offset + inner;
+        (i < self.files().len()).then_some(i)
     }
 
     fn page(&self) -> usize {
@@ -463,8 +640,22 @@ mod tests {
     }
 
     fn refreshed(groups: Vec<RepoGroup>) -> Refreshed {
+        refreshed_in(None, groups)
+    }
+
+    fn refreshed_in(ws: Option<&str>, groups: Vec<RepoGroup>) -> Refreshed {
+        let scope = if ws.is_some() {
+            Scope::Follow
+        } else {
+            Scope::All
+        };
         Refreshed {
             mode: Mode::Uncommitted,
+            target: Target {
+                scope,
+                workspace_id: ws.map(String::from),
+                label: ws.map(String::from),
+            },
             groups,
             non_repo_panes: 0,
             herdr_error: None,
@@ -528,6 +719,171 @@ mod tests {
         assert_eq!(app.diff.as_ref().unwrap().scroll, 6); // " d"
         app.on_key(key('s'));
         assert_eq!(app.diff.as_ref().unwrap().top_row(false), 6);
+    }
+
+    fn diff_for(root: &str, path: &str) -> DiffResult {
+        let text: String = (1..=50).map(|i| format!("+line {i}\n")).collect();
+        DiffResult {
+            root: root.into(),
+            mode: Mode::Uncommitted,
+            path: path.into(),
+            lines: Ok(crate::diff::parse_unified(&format!(
+                "@@ -0,0 +1,50 @@\n{text}"
+            ))),
+            highlights: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn switching_workspaces_restores_selection_and_scroll() {
+        let mut app = App::new(Mode::Uncommitted, View::Unified).with_scope(Scope::Follow, true);
+        let ws1 = || vec![group("/one", &["a", "b", "c"])];
+        let ws2 = || vec![group("/two", &["x", "y"])];
+
+        assert!(app.apply_refresh(refreshed_in(Some("w1"), ws1())));
+        app.focus = Focus::Files;
+        assert_eq!(app.on_key(key('j')), Action::LoadDiff);
+        app.on_key(key('j')); // "c"
+        app.apply_diff(diff_for("/one", "c"));
+        app.focus = Focus::Diff;
+        for _ in 0..10 {
+            app.on_key(key('j'));
+        }
+        assert_eq!(app.diff.as_ref().unwrap().scroll, 10);
+
+        // Focus moves to workspace 2: fresh selection there.
+        assert!(app.apply_refresh(refreshed_in(Some("w2"), ws2())));
+        assert_eq!(app.file().unwrap().path, "x");
+        assert!(app.diff.is_none());
+
+        // And back: file and scroll come back once the diff loads.
+        assert!(app.apply_refresh(refreshed_in(Some("w1"), ws1())));
+        assert_eq!(app.file().unwrap().path, "c");
+        app.apply_diff(diff_for("/one", "c"));
+        assert_eq!(app.diff.as_ref().unwrap().scroll, 10);
+    }
+
+    #[test]
+    fn quick_back_and_forth_keeps_pending_scroll() {
+        let mut app = App::new(Mode::Uncommitted, View::Unified).with_scope(Scope::Follow, true);
+        let ws1 = || vec![group("/one", &["a"])];
+        let ws2 = || vec![group("/two", &["x"])];
+        app.apply_refresh(refreshed_in(Some("w1"), ws1()));
+        app.apply_diff(diff_for("/one", "a"));
+        app.focus = Focus::Diff;
+        for _ in 0..5 {
+            app.on_key(key('j'));
+        }
+        app.apply_refresh(refreshed_in(Some("w2"), ws2()));
+        // Back to w1 and away again before w1's diff arrives.
+        app.apply_refresh(refreshed_in(Some("w1"), ws1()));
+        app.apply_refresh(refreshed_in(Some("w2"), ws2()));
+        app.apply_refresh(refreshed_in(Some("w1"), ws1()));
+        app.apply_diff(diff_for("/one", "a"));
+        assert_eq!(app.diff.as_ref().unwrap().scroll, 5);
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// Repos panel rows 0..10, files 10..20, diff to the right.
+    fn app_with_hitmap() -> App {
+        let mut app = App::new(Mode::Uncommitted, View::Unified);
+        app.apply_refresh(refreshed(vec![
+            group("/a", &["a1"]),
+            group("/b", &["b1", "b2", "b3"]),
+        ]));
+        app.hit = HitMap {
+            repos: Rect::new(0, 0, 40, 10),
+            files: Rect::new(0, 10, 40, 10),
+            diff: Rect::new(40, 0, 80, 20),
+            repos_offset: 0,
+            files_offset: 0,
+        };
+        app
+    }
+
+    #[test]
+    fn click_selects_repo_by_multi_row_item() {
+        let mut app = app_with_hitmap();
+        // Row 1 = repo /a, row 2 = its pane, row 3 = repo /b, row 4 = its pane.
+        let down = MouseEventKind::Down(MouseButton::Left);
+        assert_eq!(app.on_mouse(mouse(down, 5, 4)), Action::LoadDiff);
+        assert_eq!(app.repo().unwrap().root, PathBuf::from("/b"));
+        assert_eq!(app.on_mouse(mouse(down, 5, 2)), Action::LoadDiff);
+        assert_eq!(app.repo().unwrap().root, PathBuf::from("/a"));
+        // Empty space and the bottom border select nothing.
+        assert_eq!(app.on_mouse(mouse(down, 5, 7)), Action::None);
+        assert_eq!(app.on_mouse(mouse(down, 5, 9)), Action::None);
+        assert_eq!(app.repo().unwrap().root, PathBuf::from("/a"));
+    }
+
+    #[test]
+    fn click_file_and_wheel() {
+        let mut app = app_with_hitmap();
+        app.select_repo(1);
+        let down = MouseEventKind::Down(MouseButton::Left);
+        assert_eq!(app.on_mouse(mouse(down, 5, 13)), Action::LoadDiff);
+        assert_eq!(app.file().unwrap().path, "b3");
+        assert_eq!(app.focus, Focus::Files);
+        assert_eq!(
+            app.on_mouse(mouse(MouseEventKind::ScrollUp, 5, 12)),
+            Action::LoadDiff
+        );
+        assert_eq!(app.file().unwrap().path, "b2");
+
+        app.apply_diff(diff_for("/b", "b2"));
+        app.on_mouse(mouse(MouseEventKind::ScrollDown, 60, 5));
+        assert_eq!(app.diff.as_ref().unwrap().scroll, 3);
+        let mut shifted = mouse(MouseEventKind::ScrollDown, 60, 5);
+        shifted.modifiers = KeyModifiers::SHIFT;
+        app.on_mouse(shifted);
+        assert_eq!(app.diff.as_ref().unwrap().hscroll, 8);
+        // Clicking the diff focuses it.
+        app.on_mouse(mouse(down, 60, 5));
+        assert_eq!(app.focus, Focus::Diff);
+    }
+
+    #[test]
+    fn click_closes_help() {
+        let mut app = app_with_hitmap();
+        app.show_help = true;
+        let down = MouseEventKind::Down(MouseButton::Left);
+        assert_eq!(app.on_mouse(mouse(down, 5, 4)), Action::None);
+        assert!(!app.show_help);
+        assert_eq!(app.repo().unwrap().root, PathBuf::from("/a"));
+    }
+
+    #[test]
+    fn same_workspace_refresh_keeps_selection() {
+        let mut app = App::new(Mode::Uncommitted, View::Unified).with_scope(Scope::Follow, true);
+        app.apply_refresh(refreshed_in(Some("w1"), vec![group("/one", &["a", "b"])]));
+        app.focus = Focus::Files;
+        app.on_key(key('j'));
+        app.apply_refresh(refreshed_in(
+            Some("w1"),
+            vec![group("/one", &["0", "a", "b"])],
+        ));
+        assert_eq!(app.file().unwrap().path, "b");
+    }
+
+    #[test]
+    fn scope_key_cycles_and_drops_stale_results() {
+        let mut app = App::new(Mode::Uncommitted, View::Unified).with_scope(Scope::All, false);
+        assert_eq!(app.on_key(key('w')), Action::Refresh);
+        assert_eq!(app.scope, Scope::Follow);
+        // Result computed for the old scope arrives late.
+        assert!(!app.apply_refresh(refreshed_in(None, vec![group("/a", &["x"])])));
+        assert!(app.groups.is_empty());
+        // Here isn't offered outside herdr.
+        app.on_key(key('w'));
+        assert_eq!(app.scope, Scope::All);
     }
 
     #[test]

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::git::RepoStats;
 use crate::herdr::Snapshot;
+use crate::scope::Target;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaneRef {
@@ -48,8 +49,13 @@ pub struct Topology {
     pub non_repo_panes: usize,
 }
 
-/// Group panes by repo root. `resolve` maps a directory to its repo root (cached by caller).
-pub fn group_panes(snap: &Snapshot, mut resolve: impl FnMut(&Path) -> Option<PathBuf>) -> Topology {
+/// Group the panes in `target` by repo root. `resolve` maps a directory to its repo root
+/// (cached by caller). Only in-scope panes are resolved, so out-of-scope repos cost nothing.
+pub fn group_panes(
+    snap: &Snapshot,
+    target: &Target,
+    mut resolve: impl FnMut(&Path) -> Option<PathBuf>,
+) -> Topology {
     let ws: HashMap<&str, &str> = snap
         .workspaces
         .iter()
@@ -66,7 +72,11 @@ pub fn group_panes(snap: &Snapshot, mut resolve: impl FnMut(&Path) -> Option<Pat
         .map(|t| (t.tab_id.as_str(), t.label.as_str()))
         .collect();
 
-    let mut panes: Vec<_> = snap.panes.iter().collect();
+    let mut panes: Vec<_> = snap
+        .panes
+        .iter()
+        .filter(|p| target.includes(&p.workspace_id))
+        .collect();
     panes.sort_by_key(|p| {
         (
             ws_order
@@ -131,12 +141,27 @@ mod tests {
             ]
         }))
         .unwrap();
-        let topo = group_panes(&snap, |d| {
+        let all = Target {
+            scope: crate::scope::Scope::All,
+            workspace_id: None,
+            label: None,
+        };
+        let resolve = |d: &Path| {
             let s = d.to_str().unwrap();
             s.starts_with("/repo1")
                 .then(|| PathBuf::from("/repo1"))
                 .or_else(|| s.starts_with("/repo2").then(|| PathBuf::from("/repo2")))
-        });
+        };
+        let only_w2 = Target {
+            workspace_id: Some("w2".into()),
+            ..all.clone()
+        };
+        let scoped = group_panes(&snap, &only_w2, resolve);
+        assert_eq!(scoped.repos.len(), 1);
+        assert_eq!(scoped.repos[0].0, PathBuf::from("/repo2"));
+        assert_eq!(scoped.non_repo_panes, 0);
+
+        let topo = group_panes(&snap, &all, resolve);
         assert_eq!(topo.non_repo_panes, 1);
         let roots: Vec<_> = topo
             .repos

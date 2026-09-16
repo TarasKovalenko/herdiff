@@ -33,13 +33,26 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         (l, d)
     };
     let [repos_area, files_area] = if wide {
-        Layout::vertical([Constraint::Percentage(45), Constraint::Min(4)]).areas(left)
+        // Size the repo list to its content (a single scoped repo needs a few rows),
+        // capped so the file list keeps most of the column.
+        let content: usize = app.groups.iter().map(|g| 1 + g.panes.len()).sum();
+        let cap = (left.height as usize * 45 / 100).max(4);
+        // No repos: the panel holds a wrapped message (often a herdr error), give it room.
+        let height = if app.groups.is_empty() {
+            cap
+        } else {
+            (content + 2).clamp(4, cap)
+        } as u16;
+        Layout::vertical([Constraint::Length(height), Constraint::Min(4)]).areas(left)
     } else {
         Layout::horizontal([Constraint::Percentage(45), Constraint::Min(10)]).areas(left)
     };
 
-    draw_repos(f, app, repos_area);
-    draw_files(f, app, files_area);
+    app.hit.repos = repos_area;
+    app.hit.files = files_area;
+    app.hit.diff = diff_area;
+    app.hit.repos_offset = draw_repos(f, app, repos_area);
+    app.hit.files_offset = draw_files(f, app, files_area);
     draw_diff(f, app, diff_area);
     draw_status(f, app, status);
     if app.show_help {
@@ -84,7 +97,8 @@ fn counts(added: Option<u32>, removed: Option<u32>) -> Vec<Span<'static>> {
     }
 }
 
-fn draw_repos(f: &mut Frame, app: &App, area: Rect) {
+/// Returns the list scroll offset (first visible repo) for mouse hit-testing.
+fn draw_repos(f: &mut Frame, app: &App, area: Rect) -> usize {
     let focused = app.focus == Focus::Repos;
     let title = format!(" Repos ({}) ", app.groups.len());
     let width = area.width.saturating_sub(4) as usize;
@@ -149,13 +163,14 @@ fn draw_repos(f: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
-    let empty = if app.loading {
-        "loading…"
-    } else {
-        "no herdr panes inside git repos"
-    };
     if items.is_empty() {
-        let msg = app.herdr_error.clone().unwrap_or_else(|| empty.to_string());
+        let scoped = app.target.as_ref().and_then(|t| t.label.clone());
+        let msg = match (&app.herdr_error, app.loading, scoped) {
+            (Some(e), _, _) => e.clone(),
+            (None, true, _) => "loading…".into(),
+            (None, false, Some(ws)) => format!("no git repos in workspace {ws} · w to widen"),
+            (None, false, None) => "no herdr panes inside git repos".into(),
+        };
         f.render_widget(
             Paragraph::new(msg)
                 .fg(DIM)
@@ -163,7 +178,7 @@ fn draw_repos(f: &mut Frame, app: &App, area: Rect) {
                 .block(block(title, focused)),
             area,
         );
-        return;
+        return 0;
     }
     let list = List::new(items)
         .block(block(title, focused))
@@ -171,6 +186,7 @@ fn draw_repos(f: &mut Frame, app: &App, area: Rect) {
         .highlight_symbol("▌");
     let mut state = ListState::default().with_selected(Some(app.repo_idx));
     f.render_stateful_widget(list, area, &mut state);
+    state.offset()
 }
 
 fn highlight(focused: bool) -> Style {
@@ -181,11 +197,12 @@ fn highlight(focused: bool) -> Style {
     }
 }
 
-fn draw_files(f: &mut Frame, app: &App, area: Rect) {
+/// Returns the list scroll offset (first visible file) for mouse hit-testing.
+fn draw_files(f: &mut Frame, app: &App, area: Rect) -> usize {
     let focused = app.focus == Focus::Files;
     let Some(g) = app.repo() else {
         f.render_widget(block(" Files ", focused), area);
-        return;
+        return 0;
     };
     let stats = match &g.stats {
         Ok(s) => s,
@@ -197,7 +214,7 @@ fn draw_files(f: &mut Frame, app: &App, area: Rect) {
                     .block(block(" Files ", focused)),
                 area,
             );
-            return;
+            return 0;
         }
     };
     let title = format!(" Files ({}) vs {} ", stats.files.len(), stats.base);
@@ -208,7 +225,7 @@ fn draw_files(f: &mut Frame, app: &App, area: Rect) {
                 .block(block(title, focused)),
             area,
         );
-        return;
+        return 0;
     }
     let width = area.width.saturating_sub(4) as usize;
     let items: Vec<ListItem> = stats
@@ -245,6 +262,7 @@ fn draw_files(f: &mut Frame, app: &App, area: Rect) {
         .highlight_symbol("▌");
     let mut state = ListState::default().with_selected(Some(app.file_idx));
     f.render_stateful_widget(list, area, &mut state);
+    state.offset()
 }
 
 fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
@@ -485,6 +503,10 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
             format!(" {} ", app.mode.label()),
             Style::new().fg(Color::Black).bg(ACCENT).bold(),
         ),
+        Span::styled(
+            format!(" {} ", scope_badge(app)),
+            Style::new().fg(Color::Black).bg(Color::Magenta).bold(),
+        ),
         Span::raw(" "),
     ];
     if let Some(e) = &app.herdr_error {
@@ -515,12 +537,24 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
             Style::new().fg(Color::Yellow),
         ));
     }
-    let hint = " s split  m mode  a agent  e edit  ? help  q quit ";
+    let hint = " w scope  s split  m mode  a agent  e edit  ? help  q quit ";
     let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
     let pad = (area.width as usize).saturating_sub(used + hint.len());
     spans.push(Span::raw(" ".repeat(pad)));
     spans.push(Span::styled(hint, Style::new().fg(DIM)));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// `all`, `follow: MedInsight`, `here: h-diff`. Shows the requested scope while its
+/// first result is still loading.
+fn scope_badge(app: &App) -> String {
+    match &app.target {
+        Some(t) if t.scope == app.scope => match &t.label {
+            Some(label) => format!("{}: {label}", t.scope.label()),
+            None => t.scope.label().into(),
+        },
+        _ => app.scope.label().into(),
+    }
 }
 
 fn draw_help(f: &mut Frame) {
@@ -536,10 +570,18 @@ fn draw_help(f: &mut Frame) {
         ("n N", "next / previous hunk"),
         ("H L", "scroll diff horizontally"),
         ("s", "toggle side-by-side / unified view"),
+        (
+            "w",
+            "scope: all → follow focused workspace → here (herdiff's own)",
+        ),
         ("m", "cycle mode: uncommitted → unstaged → staged → branch"),
         ("r", "refresh now"),
         ("a", "focus repo's agent pane in herdr (repeat to cycle)"),
         ("e", "open file in $EDITOR at change"),
+        (
+            "mouse",
+            "wheel scrolls, click selects; shift+wheel scrolls sideways",
+        ),
         ("q / ctrl-c", "quit"),
     ];
     let area = f.area();
@@ -590,37 +632,52 @@ mod tests {
     use crate::diff::parse_unified;
     use crate::git::{FileChange, Mode, RepoStats};
     use crate::model::{PaneRef, RepoGroup};
+    use crate::scope::{Scope, Target};
     use crate::worker::{DiffResult, Refreshed};
     use ratatui::{Terminal, backend::TestBackend};
 
     fn app() -> App {
-        let mut app = App::new(Mode::Uncommitted, crate::app::View::Auto);
+        app_with(
+            Target {
+                scope: Scope::All,
+                workspace_id: None,
+                label: None,
+            },
+            true,
+        )
+    }
+
+    fn app_with(target: Target, with_repo: bool) -> App {
+        let mut app =
+            App::new(Mode::Uncommitted, crate::app::View::Auto).with_scope(target.scope, true);
         let file = FileChange {
             path: "src/lib.rs".into(),
             status: Status::Modified,
             added: Some(1),
             removed: Some(1),
         };
+        let groups = vec![RepoGroup {
+            root: "/r/proj".into(),
+            name: "proj".into(),
+            panes: vec![PaneRef {
+                pane_id: "w1:p1".into(),
+                workspace: "proj".into(),
+                tab: "1".into(),
+                agent: Some("claude".into()),
+                status: Some("working".into()),
+                title: "fixing bug".into(),
+                focused: false,
+            }],
+            stats: Ok(RepoStats {
+                branch: "main".into(),
+                base: "HEAD".into(),
+                files: vec![file],
+            }),
+        }];
         app.apply_refresh(Refreshed {
             mode: Mode::Uncommitted,
-            groups: vec![RepoGroup {
-                root: "/r/proj".into(),
-                name: "proj".into(),
-                panes: vec![PaneRef {
-                    pane_id: "w1:p1".into(),
-                    workspace: "proj".into(),
-                    tab: "1".into(),
-                    agent: Some("claude".into()),
-                    status: Some("working".into()),
-                    title: "fixing bug".into(),
-                    focused: false,
-                }],
-                stats: Ok(RepoStats {
-                    branch: "main".into(),
-                    base: "HEAD".into(),
-                    files: vec![file],
-                }),
-            }],
+            target,
+            groups: if with_repo { groups } else { Vec::new() },
             non_repo_panes: 0,
             herdr_error: None,
         });
@@ -637,7 +694,10 @@ mod tests {
     }
 
     fn render(w: u16, h: u16) -> String {
-        let mut app = app();
+        render_app(app(), w, h)
+    }
+
+    fn render_app(mut app: App, w: u16, h: u16) -> String {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         term.draw(|f| draw(f, &mut app)).unwrap();
         let buf = term.backend().buffer().clone();
@@ -649,6 +709,60 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn status_bar_names_followed_workspace() {
+        let target = Target {
+            scope: Scope::Follow,
+            workspace_id: Some("w1".into()),
+            label: Some("MedInsight".into()),
+        };
+        let screen = render_app(app_with(target.clone(), true), 160, 20);
+        assert!(
+            screen
+                .lines()
+                .last()
+                .unwrap()
+                .contains("follow: MedInsight"),
+            "{screen}"
+        );
+
+        let empty = render_app(app_with(target, false), 160, 20);
+        assert!(
+            empty.contains("no git repos in workspace MedInsight"),
+            "{empty}"
+        );
+    }
+
+    #[test]
+    fn herdr_error_is_not_cut_off() {
+        let mut app = App::new(Mode::Uncommitted, crate::app::View::Auto);
+        app.apply_refresh(Refreshed {
+            mode: Mode::Uncommitted,
+            target: Target {
+                scope: Scope::All,
+                workspace_id: None,
+                label: None,
+            },
+            groups: Vec::new(),
+            non_repo_panes: 0,
+            herdr_error: Some(
+                "connect to herdr socket /Users/someone/.config/herdr/herdr.sock: \
+                 No such file or directory (os error 2) ENDMARK"
+                    .into(),
+            ),
+        });
+        let screen = render_app(app, 160, 40);
+        assert!(screen.contains("ENDMARK"), "{screen}");
+    }
+
+    #[test]
+    fn single_repo_list_is_compact() {
+        let screen = render(160, 40);
+        // Repo panel: border + repo + 1 pane + border, then the files panel starts.
+        let files_row = screen.lines().position(|l| l.contains("Files (")).unwrap();
+        assert_eq!(files_row, 4, "{screen}");
     }
 
     #[test]

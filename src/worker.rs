@@ -11,22 +11,28 @@ use serde_json::Value;
 use crate::diff::{self, DiffLine};
 use crate::git::{self, FileChange, Mode};
 use crate::herdr::Client;
+use crate::herdr::Snapshot;
 use crate::highlight::{Highlighter, Highlights};
 use crate::model::{self, RepoGroup};
+use crate::scope::{Resolver, Scope, SelfPane, Target};
 
 pub enum Job {
     Refresh {
         mode: Mode,
+        scope: Scope,
     },
     Diff {
         root: PathBuf,
         mode: Mode,
         file: FileChange,
     },
+    /// Record herdr focus without touching git (focus moved while the scope isn't follow).
+    ObserveFocus,
 }
 
 pub struct Refreshed {
     pub mode: Mode,
+    pub target: Target,
     pub groups: Vec<RepoGroup>,
     pub non_repo_panes: usize,
     pub herdr_error: Option<String>,
@@ -44,8 +50,10 @@ pub struct DiffResult {
 pub enum AppEvent {
     Refreshed(Refreshed),
     Diff(DiffResult),
-    /// herdr reported a topology or agent status change.
-    HerdrChanged,
+    /// herdr reported a change. `focus` = only focus moved (matters for `Scope::Follow`).
+    HerdrChanged {
+        focus: bool,
+    },
     Tick,
 }
 
@@ -75,23 +83,39 @@ pub fn spawn_git_worker(
     client: Client,
     extra_dirs: Vec<PathBuf>,
     highlighter: Option<Highlighter>,
+    me: SelfPane,
     jobs: Receiver<Job>,
     out: Sender<AppEvent>,
 ) {
     thread::spawn(move || {
         let mut roots = RootCache::default();
+        let mut resolver = Resolver::default();
         while let Ok(first) = jobs.recv() {
             // Coalesce queued jobs: keep only the latest refresh and latest diff.
             let mut refresh = None;
             let mut diff = None;
+            let mut observe = false;
             for job in std::iter::once(first).chain(jobs.try_iter()) {
                 match job {
-                    Job::Refresh { mode } => refresh = Some(mode),
+                    Job::Refresh { mode, scope } => refresh = Some((mode, scope)),
                     d @ Job::Diff { .. } => diff = Some(d),
+                    Job::ObserveFocus => observe = true,
                 }
             }
-            if let Some(mode) = refresh {
-                let r = refresh_all(&client, &extra_dirs, &mut roots, mode);
+            // A refresh observes focus itself.
+            if observe
+                && refresh.is_none()
+                && let Ok(snap) = client.snapshot()
+            {
+                resolver.observe(&snap, &me);
+            }
+            if let Some((mode, scope)) = refresh {
+                let ctx = RefreshCtx {
+                    client: &client,
+                    extra_dirs: &extra_dirs,
+                    me: &me,
+                };
+                let r = refresh_all(&ctx, &mut roots, &mut resolver, mode, scope);
                 if out.send(AppEvent::Refreshed(r)).is_err() {
                     return;
                 }
@@ -119,18 +143,28 @@ pub fn spawn_git_worker(
     });
 }
 
+struct RefreshCtx<'a> {
+    client: &'a Client,
+    extra_dirs: &'a [PathBuf],
+    me: &'a SelfPane,
+}
+
 fn refresh_all(
-    client: &Client,
-    extra_dirs: &[PathBuf],
+    ctx: &RefreshCtx,
     roots: &mut RootCache,
+    resolver: &mut Resolver,
     mode: Mode,
+    scope: Scope,
 ) -> Refreshed {
-    let (snap, herdr_error) = match client.snapshot() {
-        Ok(s) => (s, None),
-        Err(e) => (Default::default(), Some(format!("{e:#}"))),
+    let (snap, herdr_error) = match ctx.client.snapshot() {
+        Ok(s) => (Some(s), None),
+        Err(e) => (None, Some(format!("{e:#}"))),
     };
-    let mut topo = model::group_panes(&snap, |d| roots.resolve(d));
-    for dir in extra_dirs {
+    let target = resolver.resolve(scope, snap.as_ref(), ctx.me);
+    let snap = snap.unwrap_or_else(Snapshot::default);
+    let mut topo = model::group_panes(&snap, &target, |d| roots.resolve(d));
+    // Repos passed with -d are always shown, whatever the scope.
+    for dir in ctx.extra_dirs {
         if let Some(root) = roots.resolve(dir)
             && !topo.repos.iter().any(|(r, _)| *r == root)
         {
@@ -158,6 +192,7 @@ fn refresh_all(
     });
     Refreshed {
         mode,
+        target,
         groups,
         non_repo_panes: topo.non_repo_panes,
         herdr_error,
@@ -175,13 +210,14 @@ pub fn spawn_herdr_listener(client: Client, out: Sender<AppEvent>) {
                 .unwrap_or_default();
             let mut closed = false;
             let res = client.subscribe(&pane_ids, |msg: &Value| {
-                if out.send(AppEvent::HerdrChanged).is_err() {
+                // Match loosely: event envelopes differ between event kinds.
+                let raw = msg.to_string();
+                let focus = event_is_focus(&raw);
+                if out.send(AppEvent::HerdrChanged { focus }).is_err() {
                     closed = true;
                     return false;
                 }
                 // Pane set changed: restart to refresh per-pane subscriptions.
-                // Match loosely: event envelopes differ between event kinds.
-                let raw = msg.to_string();
                 ![
                     "pane.created",
                     "pane.closed",
@@ -200,6 +236,12 @@ pub fn spawn_herdr_listener(client: Client, out: Sender<AppEvent>) {
     });
 }
 
+fn event_is_focus(raw: &str) -> bool {
+    ["workspace.focused", "tab.focused", "pane.focused"]
+        .iter()
+        .any(|k| raw.contains(k))
+}
+
 pub fn spawn_ticker(every: Duration, out: Sender<AppEvent>) {
     thread::spawn(move || {
         loop {
@@ -209,4 +251,18 @@ pub fn spawn_ticker(every: Duration, out: Sender<AppEvent>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_focus_events() {
+        assert!(event_is_focus(
+            r#"{"event":"pane.focused","data":{"pane_id":"w1:p1"}}"#
+        ));
+        assert!(event_is_focus(r#"{"type":"workspace.focused"}"#));
+        assert!(!event_is_focus(r#"{"event":"pane.agent_status_changed"}"#));
+    }
 }

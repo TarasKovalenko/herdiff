@@ -4,6 +4,7 @@ mod git;
 mod herdr;
 mod highlight;
 mod model;
+mod scope;
 mod ui;
 mod worker;
 
@@ -14,12 +15,16 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseEventKind,
+};
+use crossterm::execute;
 use serde_json::json;
 
 use app::{Action, App, View};
 use git::Mode;
 use herdr::Client;
+use scope::{Scope, SelfPane};
 use worker::{AppEvent, Job};
 
 /// Live diff viewer for the git repos your herdr agents are working in.
@@ -34,7 +39,12 @@ struct Cli {
     #[arg(long, short, value_enum, default_value_t = ModeArg::Uncommitted, global = true)]
     mode: ModeArg,
 
-    /// Extra directories to include even without a herdr pane
+    /// Which workspaces to show: all, follow (the one herdr focus is on) or here (herdiff's own).
+    /// Default: follow inside a herdr pane, all otherwise; `list` defaults to all
+    #[arg(long, value_enum, global = true)]
+    scope: Option<ScopeArg>,
+
+    /// Extra directories to include even without a herdr pane (shown in every scope)
     #[arg(long = "dir", short = 'd', global = true)]
     dirs: Vec<PathBuf>,
 
@@ -49,6 +59,10 @@ struct Cli {
     /// Disable syntax highlighting
     #[arg(long)]
     no_highlight: bool,
+
+    /// Don't capture the mouse (keeps the terminal's own text selection)
+    #[arg(long)]
+    no_mouse: bool,
 
     /// Print available themes and exit
     #[arg(long)]
@@ -77,6 +91,23 @@ enum ModeArg {
     Unstaged,
     Staged,
     Branch,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ScopeArg {
+    All,
+    Follow,
+    Here,
+}
+
+impl From<ScopeArg> for Scope {
+    fn from(s: ScopeArg) -> Scope {
+        match s {
+            ScopeArg::All => Scope::All,
+            ScopeArg::Follow => Scope::Follow,
+            ScopeArg::Here => Scope::Here,
+        }
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -117,8 +148,23 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
+    let me = SelfPane::from_env();
+    let scope: Option<Scope> = cli.scope.map(Into::into);
+    anyhow::ensure!(
+        scope != Some(Scope::Here) || me.inside_herdr(),
+        "--scope here needs to run inside a herdr pane (HERDR_PANE_ID is not set)"
+    );
     match cli.command {
-        Some(Cmd::List { json }) => list(client, mode, cli.dirs, json),
+        Some(Cmd::List { json }) => {
+            let opts = ListOpts {
+                mode,
+                scope: scope.unwrap_or(Scope::All),
+                me,
+                dirs: cli.dirs,
+                json,
+            };
+            list(client, opts)
+        }
         None => {
             let highlighter = if cli.no_highlight {
                 None
@@ -131,17 +177,39 @@ fn main() -> Result<()> {
                 dirs: cli.dirs,
                 interval: Duration::from_secs_f64(cli.interval.max(0.2)),
                 highlighter,
+                scope: scope.unwrap_or(if me.inside_herdr() {
+                    Scope::Follow
+                } else {
+                    Scope::All
+                }),
+                me,
+                mouse: !cli.no_mouse,
             };
             run_tui(client, opts)
         }
     }
 }
 
-fn list(client: Client, mode: Mode, dirs: Vec<PathBuf>, as_json: bool) -> Result<()> {
+struct ListOpts {
+    mode: Mode,
+    scope: Scope,
+    me: SelfPane,
+    dirs: Vec<PathBuf>,
+    json: bool,
+}
+
+fn list(client: Client, opts: ListOpts) -> Result<()> {
+    let ListOpts {
+        mode,
+        scope,
+        me,
+        dirs,
+        json: as_json,
+    } = opts;
     let (job_tx, job_rx) = mpsc::channel();
     let (tx, rx) = mpsc::channel();
-    worker::spawn_git_worker(client, dirs, None, job_rx, tx);
-    job_tx.send(Job::Refresh { mode })?;
+    worker::spawn_git_worker(client, dirs, None, me, job_rx, tx);
+    job_tx.send(Job::Refresh { mode, scope })?;
     let Ok(AppEvent::Refreshed(r)) = rx.recv() else {
         anyhow::bail!("worker failed")
     };
@@ -178,13 +246,23 @@ fn list(client: Client, mode: Mode, dirs: Vec<PathBuf>, as_json: bool) -> Result
                 })
             })
             .collect();
-        let out = json!({ "mode": mode.label(), "herdr_error": r.herdr_error, "repos": repos });
+        let out = json!({
+            "mode": mode.label(),
+            "scope": scope.label(),
+            "workspace_id": r.target.workspace_id,
+            "workspace": r.target.label,
+            "herdr_error": r.herdr_error,
+            "repos": repos,
+        });
         println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());
     }
 
     if let Some(e) = &r.herdr_error {
         eprintln!("herdr: {e}");
+    }
+    if let Some(label) = &r.target.label {
+        println!("scope {}: {label}", scope.label());
     }
     for g in &r.groups {
         match &g.stats {
@@ -228,6 +306,25 @@ struct TuiOpts {
     dirs: Vec<PathBuf>,
     interval: Duration,
     highlighter: Option<highlight::Highlighter>,
+    scope: Scope,
+    me: SelfPane,
+    mouse: bool,
+}
+
+/// Enter the TUI; mouse capture sits on top of ratatui's raw mode + alternate screen.
+fn init_terminal(mouse: bool) -> Result<ratatui::DefaultTerminal> {
+    let terminal = ratatui::init();
+    if mouse {
+        execute!(std::io::stdout(), EnableMouseCapture)?;
+    }
+    Ok(terminal)
+}
+
+fn restore_terminal(mouse: bool) {
+    if mouse {
+        let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    }
+    ratatui::restore();
 }
 
 fn run_tui(client: Client, opts: TuiOpts) -> Result<()> {
@@ -237,19 +334,37 @@ fn run_tui(client: Client, opts: TuiOpts) -> Result<()> {
         dirs,
         interval,
         highlighter,
+        scope,
+        me,
+        mouse,
     } = opts;
+    let here_available = me.inside_herdr();
     let (job_tx, job_rx) = mpsc::channel::<Job>();
     let (tx, rx) = mpsc::channel::<AppEvent>();
-    worker::spawn_git_worker(client.clone(), dirs, highlighter, job_rx, tx.clone());
+    worker::spawn_git_worker(client.clone(), dirs, highlighter, me, job_rx, tx.clone());
     worker::spawn_herdr_listener(client.clone(), tx.clone());
     worker::spawn_ticker(interval, tx);
 
-    let mut terminal = ratatui::init();
-    let mut app = App::new(mode, view);
-    job_tx.send(Job::Refresh { mode })?;
+    if mouse {
+        // ratatui's panic hook restores raw mode and the screen, not mouse reporting.
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = execute!(std::io::stdout(), DisableMouseCapture);
+            hook(info);
+        }));
+    }
+    let mut terminal = init_terminal(mouse)?;
+    let mut app = App::new(mode, view).with_scope(scope, here_available);
+    job_tx.send(Job::Refresh { mode, scope })?;
+    let refresh = |app: &App| Job::Refresh {
+        mode: app.mode,
+        scope: app.scope,
+    };
 
-    // herdr can emit bursts of events; coalesce them.
+    // herdr can emit bursts of events; coalesce them. Focus changes get a shorter
+    // delay so following another workspace feels immediate.
     const DEBOUNCE: Duration = Duration::from_millis(300);
+    const FOCUS_DEBOUNCE: Duration = Duration::from_millis(150);
     let mut refresh_due: Option<Instant> = None;
     let mut last_draw_secs = u64::MAX;
 
@@ -268,22 +383,31 @@ fn run_tui(client: Client, opts: TuiOpts) -> Result<()> {
                         match app.on_key(k) {
                             Action::None => {}
                             Action::Quit => return Ok(()),
-                            Action::Refresh => job_tx.send(Job::Refresh { mode: app.mode })?,
+                            Action::Refresh => job_tx.send(refresh(&app))?,
                             Action::LoadDiff => request_diff(&app, &job_tx)?,
                             Action::FocusPane(id) => match client.focus_pane(&id) {
                                 Ok(()) => app.flash(format!("focused {id}")),
                                 Err(e) => app.flash(format!("focus failed: {e:#}")),
                             },
                             Action::OpenEditor { path, line } => {
-                                ratatui::restore();
+                                restore_terminal(mouse);
                                 let res = open_editor(&path, line);
-                                terminal = ratatui::init();
+                                terminal = init_terminal(mouse)?;
                                 terminal.clear()?;
                                 if let Err(e) = res {
                                     app.flash(format!("editor: {e:#}"));
                                 }
-                                job_tx.send(Job::Refresh { mode: app.mode })?;
+                                job_tx.send(refresh(&app))?;
                             }
+                        }
+                    }
+                    // Pointer motion arrives constantly; only real input needs work.
+                    Event::Mouse(m) if !matches!(m.kind, MouseEventKind::Moved) => {
+                        dirty = true;
+                        match app.on_mouse(m) {
+                            Action::Refresh => job_tx.send(refresh(&app))?,
+                            Action::LoadDiff => request_diff(&app, &job_tx)?,
+                            _ => {}
                         }
                     }
                     Event::Resize(..) => dirty = true,
@@ -303,8 +427,14 @@ fn run_tui(client: Client, opts: TuiOpts) -> Result<()> {
                         app.apply_diff(d);
                         dirty = true;
                     }
-                    AppEvent::HerdrChanged => {
-                        refresh_due.get_or_insert(Instant::now() + DEBOUNCE);
+                    // Focus only matters when the scope depends on it.
+                    AppEvent::HerdrChanged { focus: true } if app.scope != Scope::Follow => {
+                        job_tx.send(Job::ObserveFocus)?;
+                    }
+                    AppEvent::HerdrChanged { focus } => {
+                        let delay = if focus { FOCUS_DEBOUNCE } else { DEBOUNCE };
+                        let due = Instant::now() + delay;
+                        refresh_due = Some(refresh_due.map_or(due, |t| t.min(due)));
                     }
                     AppEvent::Tick => {
                         refresh_due.get_or_insert(Instant::now());
@@ -313,7 +443,7 @@ fn run_tui(client: Client, opts: TuiOpts) -> Result<()> {
             }
             if refresh_due.is_some_and(|t| Instant::now() >= t) {
                 refresh_due = None;
-                job_tx.send(Job::Refresh { mode: app.mode })?;
+                job_tx.send(refresh(&app))?;
             }
             // Keep the "updated Ns ago" counter moving.
             let secs = app.last_refresh.map(|t| t.elapsed().as_secs()).unwrap_or(0);
@@ -324,7 +454,7 @@ fn run_tui(client: Client, opts: TuiOpts) -> Result<()> {
         }
     })();
 
-    ratatui::restore();
+    restore_terminal(mouse);
     result
 }
 

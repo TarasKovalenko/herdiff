@@ -24,6 +24,45 @@ JSON (`{"id","method","params"}`).
   `git ls-files --others --exclude-standard` adds untracked files.
 - `git diff <base> -- <file>` gives the patch. Untracked files use `git diff --no-index /dev/null <file>`.
 
+## Scope
+
+`w` cycles three scopes; `--scope` sets the starting one.
+
+- **follow**: the workspace from the snapshot's `focused_workspace_id`. Focus is recorded
+  from every snapshot whatever the scope (focus events in other scopes trigger a snapshot
+  with no git work), so switching to follow starts from where you actually were. When
+  `focused_pane_id` is herdiff's own pane (`HERDR_PANE_ID`), the previous workspace is
+  kept, otherwise looking at the diff would switch the view to herdiff's own workspace.
+  Before anything has been followed it falls back to herdiff's workspace. A followed
+  workspace that closes is dropped. If a snapshot fails (herdr restarting, a timeout),
+  the last target is kept rather than treating the empty result as "every workspace
+  closed". Default inside herdr.
+- **here**: herdiff's own workspace, from the snapshot entry for its pane, else
+  `HERDR_WORKSPACE_ID`. Only offered inside herdr.
+- **all**: no filter. Default outside herdr and for `list`.
+
+`scope.rs` holds this as a pure resolver (snapshot + own pane + last followed workspace in,
+target out), so the rules are unit tested without a live herdr. Filtering happens before
+repo discovery, so out-of-scope panes cost no git calls. `-d` repos are added in every scope.
+
+Focus events (`workspace.focused`, `tab.focused`, `pane.focused`) are debounced 150ms instead
+of 300ms and ignored unless the scope is follow. Results carry the scope they were computed
+for; a result for a scope you've already left is dropped. Selection (repo, file, scroll) is
+saved per target workspace and restored when you come back.
+
+Known gaps: herdr has one focus per server, so with several clients follow tracks whichever
+moved last. A pane moved to another workspace gets a new ID its process never learns, so
+herdiff stops recognising its own pane until restarted.
+
+## Mouse
+
+Mouse capture is on unless `--no-mouse`. The renderer records each panel's rectangle and
+list scroll offset every frame (`HitMap`), and `App::on_mouse` hit-tests against that, so
+mouse handling is plain state logic with unit tests. Repo list items are one row plus one
+per pane, so clicks walk item heights from the list offset. Motion events are dropped in
+the main loop before they cause a redraw. Capture is turned off before the editor starts
+and in the panic hook, since ratatui's own hook doesn't know about it.
+
 ## Diff modes
 
 1. **uncommitted**: working tree vs `HEAD`, staged, unstaged and untracked together. Default.
@@ -63,7 +102,8 @@ herdr.rs  socket client, snapshot types, event subscription
 git.rs    repo discovery, status and diff commands, output parsers
 diff.rs   unified diff parser (typed lines with old/new numbers) and unified/split row layouts
 highlight.rs syntect highlighting with bat's syntaxes and themes (two-face)
-model.rs  groups snapshot panes into repos
+model.rs  groups in-scope snapshot panes into repos
+scope.rs  all / follow / here resolution
 worker.rs background git worker, herdr listener, ticker
 app.rs    state and key handling
 ui.rs     ratatui rendering
@@ -81,7 +121,10 @@ keeps the per-pane status subscriptions in sync. If herdr isn't running it retri
 
 - Unit tests for the numstat, name-status and unified diff parsers, and for grouping panes into repos.
 - Integration tests build a temp repo with staged, unstaged, untracked and branch commits and check each mode.
-- State tests cover selection surviving a refresh and stale results being ignored.
+- State tests cover selection surviving a refresh, stale results being ignored, and
+  per-workspace selection and scroll being restored.
+- Scope tests cover follow ignoring herdiff's own pane, following other panes in its
+  workspace, dropping closed workspaces, and running outside herdr.
 - Highlighting tests cover language detection, TOML via bat's extra syntaxes, and clipping
   highlighted spans by display width (wide CJK characters included).
 - A render test draws the UI into ratatui's `TestBackend` at wide, narrow and tiny sizes.

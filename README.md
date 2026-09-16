@@ -22,6 +22,7 @@ It needs `git` on your `PATH` and runs on macOS and Linux.
 ```
 herdiff                   # uncommitted changes (the default)
 herdiff -m branch         # changes since you branched off main/master
+herdiff --scope all       # every workspace instead of the one you're in
 herdiff -d ~/src/other    # also show a repo that has no herdr pane
 herdiff --view split      # always side-by-side (auto, unified, split)
 herdiff --theme Nord      # pick a highlighting theme
@@ -46,9 +47,35 @@ the box. The default theme is Monokai Extended. `herdiff --list-themes` prints t
 `ansi` follows your terminal's palette, which is the one to try on a light background.
 `--no-highlight` turns it off.
 
+The mouse works too: scroll the panel under the pointer, click a repo or file to select it,
+click the diff to focus it. Shift+wheel scrolls the diff sideways. While herdiff has the
+mouse, your terminal's own click-and-drag selection won't work (most terminals let you
+hold Shift or Option to get it back). `--no-mouse` leaves the mouse to the terminal.
+
 `--socket PATH` points it at a different herdr socket. By default it uses
 `$HERDR_SOCKET_PATH`, then `~/.config/herdr/herdr.sock`. `--interval SECS` sets how often
 it polls git (2s by default). herdr events trigger a refresh on top of that.
+
+## Scope
+
+With several workspaces open, seeing every repo at once gets noisy. Press `w` to cycle
+what herdiff shows:
+
+- **follow**: the workspace you're working in. Jump to another workspace in herdr and the
+  view switches with you. Focusing herdiff itself doesn't count, so you can move over to
+  read a diff without it changing under you. This is the default inside herdr.
+- **here**: the workspace herdiff runs in. Handy when you keep one herdiff split beside
+  each agent.
+- **all**: every repo in every workspace. The default outside herdr and for `herdiff list`.
+
+herdiff remembers the file and scroll position for each workspace, so switching back puts
+you where you left off. Only repos in scope are diffed, so a narrow scope also means less
+git work. Repos added with `-d` show up in every scope.
+
+herdr keeps one focus for the whole server, so with several clients attached (say, a
+second one over SSH), follow tracks whichever client moved last. If you move herdiff's own
+pane to another workspace, restart it: the pane gets a new ID that the running process
+never sees.
 
 ## Modes
 
@@ -70,18 +97,20 @@ Press `m` to cycle through them.
 | `n` `N` | next / previous hunk |
 | `H` `L` | scroll sideways |
 | `s` | toggle side-by-side / unified |
+| `w` | switch scope: follow, here, all |
 | `m` | switch mode |
 | `r` | refresh now |
 | `a` | jump to the repo's agent pane in herdr (press again for the next one) |
 | `e` | open the file in `$VISUAL` or `$EDITOR` at the change |
+| mouse | wheel scrolls, click selects, shift+wheel scrolls sideways |
 | `?` | help |
 | `q` | quit |
 
 ## How it works
 
-herdiff asks herdr for a session snapshot, takes each pane's working directory and groups
-panes by `git rev-parse --show-toplevel`. It subscribes to herdr events (panes and tabs
-opening or closing, agent status changes) so the list stays current, and polls git in the
+herdiff asks herdr for a session snapshot, keeps the panes in scope, and groups them by
+`git rev-parse --show-toplevel`. It subscribes to herdr events (panes and tabs opening or
+closing, focus moving, agent status changes) so the list stays current, and polls git in the
 background to catch edits that happen between events.
 
 Highlighting runs on the same background thread as git, so a large file never stalls
