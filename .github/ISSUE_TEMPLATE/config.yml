@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/TarasKovalenko/herdiff/security/advisories/new
+    about: Report it privately. Please don't open a public issue.
+  - name: herdr
+    url: https://herdr.dev
+    about: Problems with herdr itself belong with herdr.

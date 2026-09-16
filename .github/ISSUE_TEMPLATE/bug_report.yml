@@ -1,0 +1,56 @@
+name: Bug report
+description: Something in herdiff doesn't work the way it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Please leave out private code, paths and tokens you don't want public.
+        Security problems go through [private reporting](https://github.com/TarasKovalenko/herdiff/security/advisories/new), not here.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you got instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Ideally in a throwaway git repo.
+      placeholder: |
+        1. git init /tmp/demo && cd /tmp/demo
+        2. herdiff -d .
+        3. press ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: herdiff version
+      description: Output of `herdiff --version`.
+      placeholder: herdiff 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: herdr
+    attributes:
+      label: herdr version
+      description: Output of `herdr --version`, or "not running".
+      placeholder: herdr 0.9.0
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: OS and terminal
+      placeholder: macOS 26, Ghostty
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Error text from the status bar, a screenshot, or `herdiff list --json` output (trimmed).
+      render: text

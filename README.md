@@ -1,5 +1,8 @@
 # herdiff
 
+[![ci](https://github.com/TarasKovalenko/herdiff/actions/workflows/ci.yml/badge.svg)](https://github.com/TarasKovalenko/herdiff/actions/workflows/ci.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A terminal diff viewer for [herdr](https://herdr.dev). It finds every git repo your herdr
 panes are sitting in and shows what changed, grouped by repo, while your agents keep
 editing. Leave it open in a side pane and you can watch the work land.
@@ -11,6 +14,8 @@ cargo install --git https://github.com/TarasKovalenko/herdiff
 ```
 
 Or from a local checkout: `cargo install --path .`
+
+It needs `git` on your `PATH` and runs on macOS and Linux.
 
 ## Usage
 
@@ -92,3 +97,12 @@ Nested repos inside a repo (agent worktrees under `.claude/worktrees/`, for exam
 up as one entry marked `repo`. Open them with `-d` if you want their diffs.
 
 The design notes are in [PLAN.md](PLAN.md).
+
+## Contributing
+
+Issues and pull requests are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) has the checks a
+change needs, and security reports go through [SECURITY.md](SECURITY.md).
+
+## License
+
+[MIT](LICENSE)
