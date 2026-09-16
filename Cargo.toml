@@ -1,6 +1,6 @@
 [package]
 name = "herdiff"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Live diff viewer for the git repos your herdr agents are working in"
 repository = "https://github.com/TarasKovalenko/herdiff"

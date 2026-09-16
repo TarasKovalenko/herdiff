@@ -1,6 +1,6 @@
 id = "taraskovalenko.herdiff"
 name = "herdiff"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.9.0"
 description = "Live, syntax-highlighted diffs of the git repos your agents are working in"
 # herdiff talks to herdr over its Unix socket, so no Windows.
