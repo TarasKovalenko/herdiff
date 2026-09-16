@@ -23,7 +23,12 @@ pub enum Mode {
 }
 
 impl Mode {
-    pub const ALL: [Mode; 4] = [Mode::Uncommitted, Mode::Unstaged, Mode::Staged, Mode::Branch];
+    pub const ALL: [Mode; 4] = [
+        Mode::Uncommitted,
+        Mode::Unstaged,
+        Mode::Staged,
+        Mode::Branch,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -138,7 +143,9 @@ fn run(dir: &Path, args: &[&str], ok_codes: &[i32]) -> Result<Vec<u8>> {
 }
 
 fn run_str(dir: &Path, args: &[&str]) -> Result<String> {
-    Ok(String::from_utf8_lossy(&run(dir, args, &[0])?).trim().to_string())
+    Ok(String::from_utf8_lossy(&run(dir, args, &[0])?)
+        .trim()
+        .to_string())
 }
 
 pub fn repo_root(dir: &Path) -> Option<PathBuf> {
@@ -179,7 +186,10 @@ fn base_rev(root: &Path, mode: Mode) -> Result<(Option<String>, String)> {
         Mode::Uncommitted | Mode::Staged => (Some(head), head_label.into()),
         Mode::Branch => {
             let default = default_branch(root);
-            match default.as_deref().map(|b| run_str(root, &["merge-base", "HEAD", b])) {
+            match default
+                .as_deref()
+                .map(|b| run_str(root, &["merge-base", "HEAD", b]))
+            {
                 Some(Ok(mb)) if !mb.is_empty() => {
                     let short = &mb[..mb.len().min(7)];
                     (Some(mb.clone()), format!("{}@{short}", default.unwrap()))
@@ -191,8 +201,10 @@ fn base_rev(root: &Path, mode: Mode) -> Result<(Option<String>, String)> {
 }
 
 fn default_branch(root: &Path) -> Option<String> {
-    if let Ok(r) = run_str(root, &["symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"])
-        && !r.is_empty()
+    if let Ok(r) = run_str(
+        root,
+        &["symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"],
+    ) && !r.is_empty()
     {
         return Some(r);
     }
@@ -204,7 +216,11 @@ fn default_branch(root: &Path) -> Option<String> {
 
 /// Arguments selecting what to compare, shared by numstat/name-status/patch.
 fn diff_args(mode: Mode, base: &Option<String>) -> Vec<String> {
-    let mut args = vec!["diff".to_string(), "--no-ext-diff".into(), "--no-renames".into()];
+    let mut args = vec![
+        "diff".to_string(),
+        "--no-ext-diff".into(),
+        "--no-renames".into(),
+    ];
     if mode == Mode::Staged {
         args.push("--cached".into());
     }
@@ -228,7 +244,15 @@ pub fn repo_stats(root: &Path, mode: Mode) -> Result<RepoStats> {
     let mut files: BTreeMap<String, FileChange> = parse_name_status(&name_status)
         .into_iter()
         .map(|(status, path)| {
-            (path.clone(), FileChange { path, status, added: Some(0), removed: Some(0) })
+            (
+                path.clone(),
+                FileChange {
+                    path,
+                    status,
+                    added: Some(0),
+                    removed: Some(0),
+                },
+            )
         })
         .collect();
     for (added, removed, path) in parse_numstat(&numstat) {
@@ -239,28 +263,51 @@ pub fn repo_stats(root: &Path, mode: Mode) -> Result<RepoStats> {
     }
 
     if mode.includes_untracked() {
-        let untracked = run(root, &["ls-files", "--others", "--exclude-standard", "-z"], &[0])?;
+        let untracked = run(
+            root,
+            &["ls-files", "--others", "--exclude-standard", "-z"],
+            &[0],
+        )?;
         for path in split_z(&untracked) {
             let lines = count_lines(&root.join(&path));
             files.insert(
                 path.clone(),
-                FileChange { path, status: Status::Untracked, added: lines, removed: lines.map(|_| 0) },
+                FileChange {
+                    path,
+                    status: Status::Untracked,
+                    added: lines,
+                    removed: lines.map(|_| 0),
+                },
             );
         }
     }
 
-    Ok(RepoStats { branch: branch_name(root), base: base_label, files: files.into_values().collect() })
+    Ok(RepoStats {
+        branch: branch_name(root),
+        base: base_label,
+        files: files.into_values().collect(),
+    })
 }
 
 /// Unified diff text for one file.
 pub fn file_diff(root: &Path, mode: Mode, file: &FileChange) -> Result<String> {
     if file.is_dir() {
-        return Ok(format!("untracked directory (nested git repo): {}\n", file.path));
+        return Ok(format!(
+            "untracked directory (nested git repo): {}\n",
+            file.path
+        ));
     }
     if file.status == Status::Untracked {
         let out = run(
             root,
-            &["diff", "--no-ext-diff", "--no-index", "--", "/dev/null", &file.path],
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-index",
+                "--",
+                "/dev/null",
+                &file.path,
+            ],
             &[0, 1],
         )?;
         return Ok(String::from_utf8_lossy(&out).into_owned());
@@ -285,7 +332,12 @@ fn parse_name_status(buf: &[u8]) -> Vec<(Status, String)> {
     parts
         .chunks(2)
         .filter(|c| c.len() == 2)
-        .map(|c| (Status::from_letter(c[0].chars().next().unwrap_or('?')), c[1].clone()))
+        .map(|c| {
+            (
+                Status::from_letter(c[0].chars().next().unwrap_or('?')),
+                c[1].clone(),
+            )
+        })
         .collect()
 }
 
@@ -327,12 +379,18 @@ mod tests {
         let ns = b"M\0src/a.rs\0D\0gone.txt\0";
         assert_eq!(
             parse_name_status(ns),
-            vec![(Status::Modified, "src/a.rs".into()), (Status::Deleted, "gone.txt".into())]
+            vec![
+                (Status::Modified, "src/a.rs".into()),
+                (Status::Deleted, "gone.txt".into())
+            ]
         );
         let num = b"3\t1\tsrc/a.rs\0-\t-\timg.png\0";
         assert_eq!(
             parse_numstat(num),
-            vec![(Some(3), Some(1), "src/a.rs".into()), (None, None, "img.png".into())]
+            vec![
+                (Some(3), Some(1), "src/a.rs".into()),
+                (None, None, "img.png".into())
+            ]
         );
     }
 
@@ -340,7 +398,14 @@ mod tests {
         let ok = Command::new("git")
             .arg("-C")
             .arg(dir)
-            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
             .args(args)
             .output()
             .unwrap()
@@ -372,7 +437,10 @@ mod tests {
     }
 
     fn paths(s: &RepoStats) -> Vec<(&str, char, Option<u32>, Option<u32>)> {
-        s.files.iter().map(|f| (f.path.as_str(), f.status.letter(), f.added, f.removed)).collect()
+        s.files
+            .iter()
+            .map(|f| (f.path.as_str(), f.status.letter(), f.added, f.removed))
+            .collect()
     }
 
     #[test]
@@ -384,15 +452,25 @@ mod tests {
         assert_eq!(s.branch, "feature");
         assert_eq!(
             paths(&s),
-            vec![("a.txt", 'M', Some(1), Some(1)), ("b.txt", 'M', Some(1), Some(0)), ("new.md", '?', Some(2), Some(0))]
+            vec![
+                ("a.txt", 'M', Some(1), Some(1)),
+                ("b.txt", 'M', Some(1), Some(0)),
+                ("new.md", '?', Some(2), Some(0))
+            ]
         );
         assert_eq!(s.totals(), (4, 1));
 
         let s = repo_stats(&root, Mode::Unstaged).unwrap();
-        assert_eq!(paths(&s).iter().map(|p| p.0).collect::<Vec<_>>(), vec!["a.txt", "new.md"]);
+        assert_eq!(
+            paths(&s).iter().map(|p| p.0).collect::<Vec<_>>(),
+            vec!["a.txt", "new.md"]
+        );
 
         let s = repo_stats(&root, Mode::Staged).unwrap();
-        assert_eq!(paths(&s).iter().map(|p| p.0).collect::<Vec<_>>(), vec!["b.txt"]);
+        assert_eq!(
+            paths(&s).iter().map(|p| p.0).collect::<Vec<_>>(),
+            vec!["b.txt"]
+        );
 
         let s = repo_stats(&root, Mode::Branch).unwrap();
         assert!(s.base.starts_with("main@"), "{}", s.base);

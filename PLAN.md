@@ -45,6 +45,13 @@ A repo with no commits diffs against the empty tree.
  uncommitted  updated 2s ago                 m mode  a agent  e edit  ? help  q quit
 ```
 
+The diff panel has two layouts. Unified shows one column with old and new line numbers.
+Split shows old on the left and new on the right: context lines sit on both sides, and a
+run of removed lines is paired row by row with the added lines that follow it, leaving a
+blank filler where one side is shorter. `--view auto` picks split at 140+ columns; `s`
+toggles. The scroll position is stored as a line index, not a row index, so switching
+layouts keeps the same code on screen.
+
 At 120 columns or wider, repos and files stack on the left with the diff on the right.
 Narrower terminals put the lists on top and the diff underneath.
 
@@ -54,7 +61,8 @@ Narrower terminals put the lists on top and the diff underneath.
 main.rs   CLI, terminal setup, event loop
 herdr.rs  socket client, snapshot types, event subscription
 git.rs    repo discovery, status and diff commands, output parsers
-diff.rs   unified diff parser: typed lines with old/new line numbers
+diff.rs   unified diff parser (typed lines with old/new numbers) and unified/split row layouts
+highlight.rs syntect highlighting with bat's syntaxes and themes (two-face)
 model.rs  groups snapshot panes into repos
 worker.rs background git worker, herdr listener, ticker
 app.rs    state and key handling
@@ -74,9 +82,11 @@ keeps the per-pane status subscriptions in sync. If herdr isn't running it retri
 - Unit tests for the numstat, name-status and unified diff parsers, and for grouping panes into repos.
 - Integration tests build a temp repo with staged, unstaged, untracked and branch commits and check each mode.
 - State tests cover selection surviving a refresh and stale results being ignored.
+- Highlighting tests cover language detection, TOML via bat's extra syntaxes, and clipping
+  highlighted spans by display width (wide CJK characters included).
 - A render test draws the UI into ratatui's `TestBackend` at wide, narrow and tiny sizes.
 
 ## Not done yet
 
-Side-by-side view, syntax highlighting, word-level highlighting, staging or reverting hunks
+Word-level highlighting, staging or reverting hunks
 from the viewer, and packaging as a herdr plugin.

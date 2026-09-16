@@ -5,8 +5,9 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::diff::{DiffLine, LineKind};
+use crate::diff::{DiffLine, LineKind, Rows};
 use crate::git::{FileChange, Mode};
+use crate::highlight::Highlights;
 use crate::model::RepoGroup;
 use crate::worker::{DiffResult, Refreshed};
 
@@ -17,13 +18,55 @@ pub enum Focus {
     Diff,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    /// Split when the diff panel is wide enough.
+    Auto,
+    Unified,
+    Split,
+}
+
+/// Diff panel width (columns) at which `View::Auto` switches to side-by-side.
+pub const AUTO_SPLIT_WIDTH: usize = 140;
+
 pub struct DiffView {
     pub root: PathBuf,
     pub path: String,
     pub mode: Mode,
     pub lines: Result<Vec<DiffLine>, String>,
+    pub highlights: Highlights,
+    pub unified: Rows,
+    pub split: Rows,
+    /// Index of the line anchored at the top of the viewport. Stored as a line (not a row)
+    /// so the position survives switching between unified and split layouts.
     pub scroll: usize,
     pub hscroll: usize,
+}
+
+impl DiffView {
+    pub fn rows(&self, split: bool) -> &Rows {
+        if split { &self.split } else { &self.unified }
+    }
+
+    pub fn top_row(&self, split: bool) -> usize {
+        self.rows(split)
+            .line_row
+            .get(self.scroll)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn scroll_rows(&mut self, split: bool, delta: isize) {
+        let rows = self.rows(split);
+        if rows.rows.is_empty() {
+            return;
+        }
+        let max = rows.rows.len() as isize - 1;
+        let target = (self.top_row(split) as isize)
+            .saturating_add(delta)
+            .clamp(0, max) as usize;
+        self.scroll = rows.rows[target].anchor();
+    }
 }
 
 /// Side effects the main loop must perform after handling input.
@@ -52,11 +95,14 @@ pub struct App {
     pub message: Option<(String, Instant)>,
     /// Height of the diff viewport, set by the renderer (for paging).
     pub diff_height: usize,
+    /// Inner width of the diff panel, set by the renderer (for `View::Auto`).
+    pub diff_width: usize,
+    pub view: View,
     agent_cycle: usize,
 }
 
 impl App {
-    pub fn new(mode: Mode) -> Self {
+    pub fn new(mode: Mode, view: View) -> Self {
         Self {
             mode,
             groups: Vec::new(),
@@ -71,6 +117,8 @@ impl App {
             show_help: false,
             message: None,
             diff_height: 20,
+            diff_width: 80,
+            view,
             agent_cycle: 0,
         }
     }
@@ -88,6 +136,14 @@ impl App {
 
     pub fn file(&self) -> Option<&FileChange> {
         self.files().get(self.file_idx)
+    }
+
+    pub fn split_active(&self) -> bool {
+        match self.view {
+            View::Split => true,
+            View::Unified => false,
+            View::Auto => self.diff_width >= AUTO_SPLIT_WIDTH,
+        }
     }
 
     pub fn flash(&mut self, msg: impl Into<String>) {
@@ -134,24 +190,31 @@ impl App {
         if g.root != d.root || f.path != d.path || d.mode != self.mode {
             return; // selection moved on
         }
-        match &mut self.diff {
-            Some(v) if v.root == d.root && v.path == d.path && v.mode == d.mode => {
-                v.lines = d.lines;
-                let max = v.lines.as_ref().map(|l| l.len()).unwrap_or(0).saturating_sub(1);
-                v.scroll = v.scroll.min(max);
-            }
-            _ => {
-                let scroll = first_change(&d.lines);
-                self.diff = Some(DiffView {
-                    root: d.root,
-                    path: d.path,
-                    mode: d.mode,
-                    lines: d.lines,
-                    scroll,
-                    hscroll: 0,
-                });
-            }
-        }
+        let (unified, split) = match &d.lines {
+            Ok(l) => (Rows::unified(l), Rows::split(l)),
+            Err(_) => Default::default(),
+        };
+        let keep_scroll = self
+            .diff
+            .as_ref()
+            .filter(|v| v.root == d.root && v.path == d.path && v.mode == d.mode)
+            .map(|v| (v.scroll, v.hscroll));
+        let line_count = d.lines.as_ref().map(|l| l.len()).unwrap_or(0);
+        let (scroll, hscroll) = match keep_scroll {
+            Some((s, h)) => (s.min(line_count.saturating_sub(1)), h),
+            None => (first_change(&d.lines), 0),
+        };
+        self.diff = Some(DiffView {
+            root: d.root,
+            path: d.path,
+            mode: d.mode,
+            lines: d.lines,
+            highlights: d.highlights,
+            unified,
+            split,
+            scroll,
+            hscroll,
+        });
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
@@ -211,6 +274,19 @@ impl App {
                 Action::Refresh
             }
             KeyCode::Char('a') => self.next_agent_pane(),
+            KeyCode::Char('s') => {
+                self.view = if self.split_active() {
+                    View::Unified
+                } else {
+                    View::Split
+                };
+                self.flash(if self.split_active() {
+                    "side-by-side view"
+                } else {
+                    "unified view"
+                });
+                Action::None
+            }
             KeyCode::Char('e') => self.open_editor(),
             _ => Action::None,
         }
@@ -251,7 +327,11 @@ impl App {
         self.file_idx = 0;
         self.agent_cycle = 0;
         self.diff = None;
-        if self.file().is_some() { Action::LoadDiff } else { Action::None }
+        if self.file().is_some() {
+            Action::LoadDiff
+        } else {
+            Action::None
+        }
     }
 
     fn select_file(&mut self, idx: isize) -> Action {
@@ -260,13 +340,17 @@ impl App {
             return Action::None;
         }
         self.file_idx = idx;
-        if self.file().is_some() { Action::LoadDiff } else { Action::None }
+        if self.file().is_some() {
+            Action::LoadDiff
+        } else {
+            Action::None
+        }
     }
 
     fn scroll_diff(&mut self, delta: isize) -> Action {
+        let split = self.split_active();
         if let Some(v) = &mut self.diff {
-            let len = v.lines.as_ref().map(|l| l.len()).unwrap_or(0);
-            v.scroll = (v.scroll as isize + delta).clamp(0, len.saturating_sub(1) as isize) as usize;
+            v.scroll_rows(split, delta);
         }
         Action::None
     }
@@ -279,8 +363,12 @@ impl App {
     }
 
     fn jump_hunk(&mut self, forward: bool) -> Action {
-        let Some(v) = &mut self.diff else { return Action::None };
-        let Ok(lines) = &v.lines else { return Action::None };
+        let Some(v) = &mut self.diff else {
+            return Action::None;
+        };
+        let Ok(lines) = &v.lines else {
+            return Action::None;
+        };
         let is_hunk = |i: &usize| lines[*i].kind == LineKind::Hunk;
         let found = if forward {
             (v.scroll + 1..lines.len()).find(is_hunk)
@@ -294,7 +382,9 @@ impl App {
     }
 
     fn next_agent_pane(&mut self) -> Action {
-        let Some(g) = self.repo() else { return Action::None };
+        let Some(g) = self.repo() else {
+            return Action::None;
+        };
         // Prefer agent panes; fall back to any pane in the repo.
         let mut panes: Vec<_> = g.panes.iter().filter(|p| p.is_agent()).collect();
         if panes.is_empty() {
@@ -310,7 +400,9 @@ impl App {
     }
 
     fn open_editor(&mut self) -> Action {
-        let (Some(g), Some(f)) = (self.repo(), self.file()) else { return Action::None };
+        let (Some(g), Some(f)) = (self.repo(), self.file()) else {
+            return Action::None;
+        };
         let path = g.root.join(&f.path);
         // Line of the first change at or below the current scroll position.
         let line = self.diff.as_ref().and_then(|v| {
@@ -342,7 +434,12 @@ mod tests {
     use crate::model::PaneRef;
 
     fn file(path: &str) -> FileChange {
-        FileChange { path: path.into(), status: Status::Modified, added: Some(1), removed: Some(0) }
+        FileChange {
+            path: path.into(),
+            status: Status::Modified,
+            added: Some(1),
+            removed: Some(0),
+        }
     }
 
     fn group(root: &str, files: &[&str]) -> RepoGroup {
@@ -358,12 +455,20 @@ mod tests {
                 title: String::new(),
                 focused: false,
             }],
-            stats: Ok(RepoStats { files: files.iter().map(|f| file(f)).collect(), ..Default::default() }),
+            stats: Ok(RepoStats {
+                files: files.iter().map(|f| file(f)).collect(),
+                ..Default::default()
+            }),
         }
     }
 
     fn refreshed(groups: Vec<RepoGroup>) -> Refreshed {
-        Refreshed { mode: Mode::Uncommitted, groups, non_repo_panes: 0, herdr_error: None }
+        Refreshed {
+            mode: Mode::Uncommitted,
+            groups,
+            non_repo_panes: 0,
+            herdr_error: None,
+        }
     }
 
     fn key(c: char) -> KeyEvent {
@@ -372,8 +477,11 @@ mod tests {
 
     #[test]
     fn selection_survives_refresh_reordering() {
-        let mut app = App::new(Mode::Uncommitted);
-        app.apply_refresh(refreshed(vec![group("/a", &["x"]), group("/b", &["p", "q", "r"])]));
+        let mut app = App::new(Mode::Uncommitted, View::Unified);
+        app.apply_refresh(refreshed(vec![
+            group("/a", &["x"]),
+            group("/b", &["p", "q", "r"]),
+        ]));
         assert_eq!(app.on_key(key('j')), Action::LoadDiff);
         app.focus = Focus::Files;
         app.on_key(key('j'));
@@ -381,14 +489,59 @@ mod tests {
         assert_eq!(app.file().unwrap().path, "r");
 
         // Repo order flips and a file is inserted before the selected one.
-        app.apply_refresh(refreshed(vec![group("/b", &["a", "p", "q", "r"]), group("/a", &["x"])]));
+        app.apply_refresh(refreshed(vec![
+            group("/b", &["a", "p", "q", "r"]),
+            group("/a", &["x"]),
+        ]));
         assert_eq!(app.repo().unwrap().root, PathBuf::from("/b"));
         assert_eq!(app.file().unwrap().path, "r");
     }
 
     #[test]
+    fn scroll_position_survives_view_toggle() {
+        use crate::diff::parse_unified;
+        let mut app = App::new(Mode::Uncommitted, View::Unified);
+        app.apply_refresh(refreshed(vec![group("/a", &["x"])]));
+        let text = "@@ -1,4 +1,4 @@\n a\n-b\n-c\n+B\n+C\n d\n e\n";
+        app.apply_diff(DiffResult {
+            root: "/a".into(),
+            mode: Mode::Uncommitted,
+            path: "x".into(),
+            lines: Ok(parse_unified(text)),
+            highlights: Vec::new(),
+        });
+        app.focus = Focus::Diff;
+        app.on_key(key('j'));
+        app.on_key(key('j'));
+        app.on_key(key('j'));
+        app.on_key(key('j')); // unified row 4 = "+B"
+        assert_eq!(app.diff.as_ref().unwrap().scroll, 4);
+
+        app.on_key(key('s'));
+        assert!(app.split_active());
+        let v = app.diff.as_ref().unwrap();
+        // "+B" shares split row 2 with "-b"
+        assert_eq!(v.top_row(true), 2);
+        app.on_key(key('j'));
+        assert_eq!(app.diff.as_ref().unwrap().scroll, 3); // row 3 = "-c" | "+C"
+        app.on_key(key('j'));
+        assert_eq!(app.diff.as_ref().unwrap().scroll, 6); // " d"
+        app.on_key(key('s'));
+        assert_eq!(app.diff.as_ref().unwrap().top_row(false), 6);
+    }
+
+    #[test]
+    fn auto_view_follows_width() {
+        let mut app = App::new(Mode::Uncommitted, View::Auto);
+        app.diff_width = AUTO_SPLIT_WIDTH - 1;
+        assert!(!app.split_active());
+        app.diff_width = AUTO_SPLIT_WIDTH;
+        assert!(app.split_active());
+    }
+
+    #[test]
     fn stale_mode_results_are_ignored() {
-        let mut app = App::new(Mode::Uncommitted);
+        let mut app = App::new(Mode::Uncommitted, View::Unified);
         app.on_key(key('m'));
         assert!(!app.apply_refresh(refreshed(vec![group("/a", &["x"])])));
         assert!(app.groups.is_empty());
@@ -396,7 +549,7 @@ mod tests {
 
     #[test]
     fn agent_jump_cycles_panes() {
-        let mut app = App::new(Mode::Uncommitted);
+        let mut app = App::new(Mode::Uncommitted, View::Unified);
         app.apply_refresh(refreshed(vec![group("/a", &["x"])]));
         assert_eq!(app.on_key(key('a')), Action::FocusPane("/a:p1".into()));
     }

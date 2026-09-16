@@ -133,7 +133,11 @@ impl Client {
 
     /// Subscribe to events and call `on_event` for every pushed message.
     /// Blocks until the connection closes or `on_event` returns false.
-    pub fn subscribe(&self, pane_ids: &[String], mut on_event: impl FnMut(&Value) -> bool) -> Result<()> {
+    pub fn subscribe(
+        &self,
+        pane_ids: &[String],
+        mut on_event: impl FnMut(&Value) -> bool,
+    ) -> Result<()> {
         const TOPOLOGY: &[&str] = &[
             "workspace.created",
             "workspace.closed",
@@ -167,7 +171,9 @@ impl Client {
         let reader = BufReader::new(stream);
         for line in reader.lines() {
             let line = line?;
-            let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
+            let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
             if let Some(err) = msg.get("error") {
                 bail!("events.subscribe failed: {err}");
             }

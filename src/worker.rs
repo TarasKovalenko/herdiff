@@ -11,11 +11,18 @@ use serde_json::Value;
 use crate::diff::{self, DiffLine};
 use crate::git::{self, FileChange, Mode};
 use crate::herdr::Client;
+use crate::highlight::{Highlighter, Highlights};
 use crate::model::{self, RepoGroup};
 
 pub enum Job {
-    Refresh { mode: Mode },
-    Diff { root: PathBuf, mode: Mode, file: FileChange },
+    Refresh {
+        mode: Mode,
+    },
+    Diff {
+        root: PathBuf,
+        mode: Mode,
+        file: FileChange,
+    },
 }
 
 pub struct Refreshed {
@@ -30,6 +37,8 @@ pub struct DiffResult {
     pub mode: Mode,
     pub path: String,
     pub lines: Result<Vec<DiffLine>, String>,
+    /// Parallel to `lines`; empty when highlighting is off or the diff failed.
+    pub highlights: Highlights,
 }
 
 pub enum AppEvent {
@@ -56,12 +65,19 @@ impl RootCache {
             return root.clone();
         }
         let root = git::repo_root(dir);
-        self.map.insert(dir.to_path_buf(), (root.clone(), Instant::now()));
+        self.map
+            .insert(dir.to_path_buf(), (root.clone(), Instant::now()));
         root
     }
 }
 
-pub fn spawn_git_worker(client: Client, extra_dirs: Vec<PathBuf>, jobs: Receiver<Job>, out: Sender<AppEvent>) {
+pub fn spawn_git_worker(
+    client: Client,
+    extra_dirs: Vec<PathBuf>,
+    highlighter: Option<Highlighter>,
+    jobs: Receiver<Job>,
+    out: Sender<AppEvent>,
+) {
     thread::spawn(move || {
         let mut roots = RootCache::default();
         while let Ok(first) = jobs.recv() {
@@ -84,7 +100,17 @@ pub fn spawn_git_worker(client: Client, extra_dirs: Vec<PathBuf>, jobs: Receiver
                 let lines = git::file_diff(&root, mode, &file)
                     .map(|t| diff::parse_unified(&t))
                     .map_err(|e| e.to_string());
-                let res = DiffResult { root, mode, path: file.path, lines };
+                let highlights = match (&highlighter, &lines) {
+                    (Some(h), Ok(l)) => h.highlight(&file.path, l),
+                    _ => Vec::new(),
+                };
+                let res = DiffResult {
+                    root,
+                    mode,
+                    path: file.path,
+                    lines,
+                    highlights,
+                };
                 if out.send(AppEvent::Diff(res)).is_err() {
                     return;
                 }
@@ -93,7 +119,12 @@ pub fn spawn_git_worker(client: Client, extra_dirs: Vec<PathBuf>, jobs: Receiver
     });
 }
 
-fn refresh_all(client: &Client, extra_dirs: &[PathBuf], roots: &mut RootCache, mode: Mode) -> Refreshed {
+fn refresh_all(
+    client: &Client,
+    extra_dirs: &[PathBuf],
+    roots: &mut RootCache,
+    mode: Mode,
+) -> Refreshed {
     let (snap, herdr_error) = match client.snapshot() {
         Ok(s) => (s, None),
         Err(e) => (Default::default(), Some(format!("{e:#}"))),
@@ -114,13 +145,23 @@ fn refresh_all(client: &Client, extra_dirs: &[PathBuf], roots: &mut RootCache, m
             .map(|(root, panes)| {
                 s.spawn(move || {
                     let stats = git::repo_stats(&root, mode).map_err(|e| format!("{e:#}"));
-                    RepoGroup { name: model::repo_name(&root), root, panes, stats }
+                    RepoGroup {
+                        name: model::repo_name(&root),
+                        root,
+                        panes,
+                        stats,
+                    }
                 })
             })
             .collect();
         handles.into_iter().filter_map(|h| h.join().ok()).collect()
     });
-    Refreshed { mode, groups, non_repo_panes: topo.non_repo_panes, herdr_error }
+    Refreshed {
+        mode,
+        groups,
+        non_repo_panes: topo.non_repo_panes,
+        herdr_error,
+    }
 }
 
 /// Subscribe to herdr events; re-subscribes when panes change so per-pane
@@ -141,9 +182,14 @@ pub fn spawn_herdr_listener(client: Client, out: Sender<AppEvent>) {
                 // Pane set changed: restart to refresh per-pane subscriptions.
                 // Match loosely: event envelopes differ between event kinds.
                 let raw = msg.to_string();
-                !["pane.created", "pane.closed", "pane.moved", "workspace.closed"]
-                    .iter()
-                    .any(|k| raw.contains(k))
+                ![
+                    "pane.created",
+                    "pane.closed",
+                    "pane.moved",
+                    "workspace.closed",
+                ]
+                .iter()
+                .any(|k| raw.contains(k))
             });
             if closed {
                 return;

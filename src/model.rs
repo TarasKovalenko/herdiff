@@ -55,13 +55,27 @@ pub fn group_panes(snap: &Snapshot, mut resolve: impl FnMut(&Path) -> Option<Pat
         .iter()
         .map(|w| (w.workspace_id.as_str(), w.label.as_str()))
         .collect();
-    let ws_order: HashMap<&str, u32> =
-        snap.workspaces.iter().map(|w| (w.workspace_id.as_str(), w.number)).collect();
-    let tabs: HashMap<&str, &str> =
-        snap.tabs.iter().map(|t| (t.tab_id.as_str(), t.label.as_str())).collect();
+    let ws_order: HashMap<&str, u32> = snap
+        .workspaces
+        .iter()
+        .map(|w| (w.workspace_id.as_str(), w.number))
+        .collect();
+    let tabs: HashMap<&str, &str> = snap
+        .tabs
+        .iter()
+        .map(|t| (t.tab_id.as_str(), t.label.as_str()))
+        .collect();
 
     let mut panes: Vec<_> = snap.panes.iter().collect();
-    panes.sort_by_key(|p| (ws_order.get(p.workspace_id.as_str()).copied().unwrap_or(u32::MAX), p.pane_id.clone()));
+    panes.sort_by_key(|p| {
+        (
+            ws_order
+                .get(p.workspace_id.as_str())
+                .copied()
+                .unwrap_or(u32::MAX),
+            p.pane_id.clone(),
+        )
+    });
 
     let mut repos: Vec<(PathBuf, Vec<PaneRef>)> = Vec::new();
     let mut non_repo_panes = 0;
@@ -84,7 +98,10 @@ pub fn group_panes(snap: &Snapshot, mut resolve: impl FnMut(&Path) -> Option<Pat
             None => repos.push((root, vec![pref])),
         }
     }
-    Topology { repos, non_repo_panes }
+    Topology {
+        repos,
+        non_repo_panes,
+    }
 }
 
 pub fn repo_name(root: &Path) -> String {
@@ -116,11 +133,16 @@ mod tests {
         .unwrap();
         let topo = group_panes(&snap, |d| {
             let s = d.to_str().unwrap();
-            s.starts_with("/repo1").then(|| PathBuf::from("/repo1"))
+            s.starts_with("/repo1")
+                .then(|| PathBuf::from("/repo1"))
                 .or_else(|| s.starts_with("/repo2").then(|| PathBuf::from("/repo2")))
         });
         assert_eq!(topo.non_repo_panes, 1);
-        let roots: Vec<_> = topo.repos.iter().map(|(r, p)| (r.to_str().unwrap(), p.len())).collect();
+        let roots: Vec<_> = topo
+            .repos
+            .iter()
+            .map(|(r, p)| (r.to_str().unwrap(), p.len()))
+            .collect();
         assert_eq!(roots, vec![("/repo1", 2), ("/repo2", 1)]);
         assert_eq!(topo.repos[0].1[0].workspace, "A");
         assert_eq!(topo.repos[0].1[0].tab, "main");

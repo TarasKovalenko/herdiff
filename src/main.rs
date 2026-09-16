@@ -2,6 +2,7 @@ mod app;
 mod diff;
 mod git;
 mod herdr;
+mod highlight;
 mod model;
 mod ui;
 mod worker;
@@ -16,7 +17,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use crossterm::event::{self, Event, KeyEventKind};
 use serde_json::json;
 
-use app::{Action, App};
+use app::{Action, App, View};
 use git::Mode;
 use herdr::Client;
 use worker::{AppEvent, Job};
@@ -36,6 +37,22 @@ struct Cli {
     /// Extra directories to include even without a herdr pane
     #[arg(long = "dir", short = 'd', global = true)]
     dirs: Vec<PathBuf>,
+
+    /// Diff layout: auto = side-by-side when the diff panel is at least 140 columns wide
+    #[arg(long, value_enum, default_value_t = ViewArg::Auto)]
+    view: ViewArg,
+
+    /// Syntax highlighting theme (see --list-themes)
+    #[arg(long, default_value = highlight::DEFAULT_THEME)]
+    theme: String,
+
+    /// Disable syntax highlighting
+    #[arg(long)]
+    no_highlight: bool,
+
+    /// Print available themes and exit
+    #[arg(long)]
+    list_themes: bool,
 
     /// Poll interval in seconds (herdr events trigger refreshes in between)
     #[arg(long, default_value_t = 2.0)]
@@ -62,6 +79,23 @@ enum ModeArg {
     Branch,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum ViewArg {
+    Auto,
+    Unified,
+    Split,
+}
+
+impl From<ViewArg> for View {
+    fn from(v: ViewArg) -> View {
+        match v {
+            ViewArg::Auto => View::Auto,
+            ViewArg::Unified => View::Unified,
+            ViewArg::Split => View::Split,
+        }
+    }
+}
+
 impl From<ModeArg> for Mode {
     fn from(m: ModeArg) -> Mode {
         match m {
@@ -77,18 +111,40 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let client = Client::new(cli.socket.clone());
     let mode: Mode = cli.mode.into();
+    if cli.list_themes {
+        for name in highlight::theme_names() {
+            println!("{name}");
+        }
+        return Ok(());
+    }
     match cli.command {
         Some(Cmd::List { json }) => list(client, mode, cli.dirs, json),
-        None => run_tui(client, mode, cli.dirs, Duration::from_secs_f64(cli.interval.max(0.2))),
+        None => {
+            let highlighter = if cli.no_highlight {
+                None
+            } else {
+                Some(highlight::Highlighter::new(&cli.theme)?)
+            };
+            let opts = TuiOpts {
+                mode,
+                view: cli.view.into(),
+                dirs: cli.dirs,
+                interval: Duration::from_secs_f64(cli.interval.max(0.2)),
+                highlighter,
+            };
+            run_tui(client, opts)
+        }
     }
 }
 
 fn list(client: Client, mode: Mode, dirs: Vec<PathBuf>, as_json: bool) -> Result<()> {
     let (job_tx, job_rx) = mpsc::channel();
     let (tx, rx) = mpsc::channel();
-    worker::spawn_git_worker(client, dirs, job_rx, tx);
+    worker::spawn_git_worker(client, dirs, None, job_rx, tx);
     job_tx.send(Job::Refresh { mode })?;
-    let Ok(AppEvent::Refreshed(r)) = rx.recv() else { anyhow::bail!("worker failed") };
+    let Ok(AppEvent::Refreshed(r)) = rx.recv() else {
+        anyhow::bail!("worker failed")
+    };
 
     if as_json {
         let repos: Vec<_> = r
@@ -134,7 +190,13 @@ fn list(client: Client, mode: Mode, dirs: Vec<PathBuf>, as_json: bool) -> Result
         match &g.stats {
             Ok(s) => {
                 let (a, d) = s.totals();
-                println!("{}  [{}]  {} files  +{a} -{d}  (vs {})", g.root.display(), s.branch, s.files.len(), s.base);
+                println!(
+                    "{}  [{}]  {} files  +{a} -{d}  (vs {})",
+                    g.root.display(),
+                    s.branch,
+                    s.files.len(),
+                    s.base
+                );
                 for p in &g.panes {
                     println!(
                         "  pane {} {}/{} {} {}",
@@ -160,15 +222,30 @@ fn list(client: Client, mode: Mode, dirs: Vec<PathBuf>, as_json: bool) -> Result
     Ok(())
 }
 
-fn run_tui(client: Client, mode: Mode, dirs: Vec<PathBuf>, interval: Duration) -> Result<()> {
+struct TuiOpts {
+    mode: Mode,
+    view: View,
+    dirs: Vec<PathBuf>,
+    interval: Duration,
+    highlighter: Option<highlight::Highlighter>,
+}
+
+fn run_tui(client: Client, opts: TuiOpts) -> Result<()> {
+    let TuiOpts {
+        mode,
+        view,
+        dirs,
+        interval,
+        highlighter,
+    } = opts;
     let (job_tx, job_rx) = mpsc::channel::<Job>();
     let (tx, rx) = mpsc::channel::<AppEvent>();
-    worker::spawn_git_worker(client.clone(), dirs, job_rx, tx.clone());
+    worker::spawn_git_worker(client.clone(), dirs, highlighter, job_rx, tx.clone());
     worker::spawn_herdr_listener(client.clone(), tx.clone());
     worker::spawn_ticker(interval, tx);
 
     let mut terminal = ratatui::init();
-    let mut app = App::new(mode);
+    let mut app = App::new(mode, view);
     job_tx.send(Job::Refresh { mode })?;
 
     // herdr can emit bursts of events; coalesce them.
@@ -253,7 +330,11 @@ fn run_tui(client: Client, mode: Mode, dirs: Vec<PathBuf>, interval: Duration) -
 
 fn request_diff(app: &App, jobs: &mpsc::Sender<Job>) -> Result<()> {
     if let (Some(g), Some(f)) = (app.repo(), app.file()) {
-        jobs.send(Job::Diff { root: g.root.clone(), mode: app.mode, file: f.clone() })?;
+        jobs.send(Job::Diff {
+            root: g.root.clone(),
+            mode: app.mode,
+            file: f.clone(),
+        })?;
     }
     Ok(())
 }
@@ -266,7 +347,10 @@ fn open_editor(path: &std::path::Path, line: Option<u32>) -> Result<()> {
     let bin = parts.next().unwrap_or("vi");
     let mut cmd = Command::new(bin);
     cmd.args(parts);
-    let name = std::path::Path::new(bin).file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let name = std::path::Path::new(bin)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
     if let Some(l) = line {
         match name {
             "code" | "cursor" | "zed" | "subl" => {

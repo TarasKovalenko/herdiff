@@ -7,18 +7,23 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::app::{App, Focus};
-use crate::diff::LineKind;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+use crate::diff::{DiffLine, LineKind, Row};
 use crate::git::Status;
+use crate::highlight::{Fg, Highlights, HlSpan};
 
 const ADD_FG: Color = Color::Green;
 const DEL_FG: Color = Color::Red;
 const ADD_BG: Color = Color::Rgb(18, 46, 28);
 const DEL_BG: Color = Color::Rgb(58, 22, 26);
+const FILLER_BG: Color = Color::Rgb(28, 28, 32);
 const DIM: Color = Color::DarkGray;
 const ACCENT: Color = Color::Cyan;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
-    let [main, status] = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(f.area());
+    let [main, status] =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(f.area());
     let wide = main.width >= 120;
     let (left, diff_area) = if wide {
         let [l, d] = Layout::horizontal([Constraint::Length(46), Constraint::Min(20)]).areas(main);
@@ -43,9 +48,17 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 }
 
 fn block(title: impl Into<Line<'static>>, focused: bool) -> Block<'static> {
-    let style = if focused { Style::new().fg(ACCENT) } else { Style::new().fg(DIM) };
+    let style = if focused {
+        Style::new().fg(ACCENT)
+    } else {
+        Style::new().fg(DIM)
+    };
     Block::bordered()
-        .border_type(if focused { BorderType::Thick } else { BorderType::Rounded })
+        .border_type(if focused {
+            BorderType::Thick
+        } else {
+            BorderType::Rounded
+        })
         .border_style(style)
         .title(title)
 }
@@ -88,11 +101,17 @@ fn draw_repos(f: &mut Frame, app: &App, area: Rect) {
             match &g.stats {
                 Ok(s) => {
                     let (a, r) = s.totals();
-                    head.push(Span::styled(format!(" {} ", s.branch), Style::new().fg(Color::Magenta)));
+                    head.push(Span::styled(
+                        format!(" {} ", s.branch),
+                        Style::new().fg(Color::Magenta),
+                    ));
                     if s.files.is_empty() {
                         head.push(Span::styled("clean", Style::new().fg(DIM)));
                     } else {
-                        head.push(Span::styled(format!("{}f ", s.files.len()), Style::new().fg(DIM)));
+                        head.push(Span::styled(
+                            format!("{}f ", s.files.len()),
+                            Style::new().fg(DIM),
+                        ));
                         head.extend(counts(Some(a), Some(r)));
                     }
                 }
@@ -111,20 +130,37 @@ fn draw_repos(f: &mut Frame, app: &App, area: Rect) {
                 lines.push(Line::from(vec![
                     Span::raw("  "),
                     Span::styled(format!("{icon} "), style),
-                    Span::styled(who, if p.is_agent() { style } else { Style::new().fg(DIM) }),
+                    Span::styled(
+                        who,
+                        if p.is_agent() {
+                            style
+                        } else {
+                            Style::new().fg(DIM)
+                        },
+                    ),
                     Span::raw(" "),
-                    Span::styled(truncate(&detail, width.saturating_sub(used)), Style::new().fg(DIM)),
+                    Span::styled(
+                        truncate(&detail, width.saturating_sub(used)),
+                        Style::new().fg(DIM),
+                    ),
                 ]));
             }
             ListItem::new(Text::from(lines))
         })
         .collect();
 
-    let empty = if app.loading { "loading…" } else { "no herdr panes inside git repos" };
+    let empty = if app.loading {
+        "loading…"
+    } else {
+        "no herdr panes inside git repos"
+    };
     if items.is_empty() {
         let msg = app.herdr_error.clone().unwrap_or_else(|| empty.to_string());
         f.render_widget(
-            Paragraph::new(msg).fg(DIM).wrap(Wrap { trim: true }).block(block(title, focused)),
+            Paragraph::new(msg)
+                .fg(DIM)
+                .wrap(Wrap { trim: true })
+                .block(block(title, focused)),
             area,
         );
         return;
@@ -155,7 +191,10 @@ fn draw_files(f: &mut Frame, app: &App, area: Rect) {
         Ok(s) => s,
         Err(e) => {
             f.render_widget(
-                Paragraph::new(e.clone()).fg(DEL_FG).wrap(Wrap { trim: true }).block(block(" Files ", focused)),
+                Paragraph::new(e.clone())
+                    .fg(DEL_FG)
+                    .wrap(Wrap { trim: true })
+                    .block(block(" Files ", focused)),
                 area,
             );
             return;
@@ -164,7 +203,9 @@ fn draw_files(f: &mut Frame, app: &App, area: Rect) {
     let title = format!(" Files ({}) vs {} ", stats.files.len(), stats.base);
     if stats.files.is_empty() {
         f.render_widget(
-            Paragraph::new(format!("no {} changes", app.mode.label())).fg(DIM).block(block(title, focused)),
+            Paragraph::new(format!("no {} changes", app.mode.label()))
+                .fg(DIM)
+                .block(block(title, focused)),
             area,
         );
         return;
@@ -188,7 +229,10 @@ fn draw_files(f: &mut Frame, app: &App, area: Rect) {
             let cnt_len: usize = cnt.iter().map(|s| s.content.chars().count()).sum();
             let path_w = width.saturating_sub(cnt_len + 3);
             let mut spans = vec![
-                Span::styled(format!("{} ", file.status.letter()), Style::new().fg(color).bold()),
+                Span::styled(
+                    format!("{} ", file.status.letter()),
+                    Style::new().fg(color).bold(),
+                ),
                 Span::raw(format!("{:<path_w$} ", truncate_left(&file.path, path_w))),
             ];
             spans.extend(cnt);
@@ -206,81 +250,74 @@ fn draw_files(f: &mut Frame, app: &App, area: Rect) {
 fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Diff;
     app.diff_height = area.height.saturating_sub(2) as usize;
+    app.diff_width = area.width.saturating_sub(2) as usize;
+    let split = app.split_active();
     let Some(view) = &app.diff else {
-        let msg = if app.file().is_some() { "loading…" } else { "" };
-        f.render_widget(Paragraph::new(msg).fg(DIM).block(block(" Diff ", focused)), area);
+        let msg = if app.file().is_some() {
+            "loading…"
+        } else {
+            ""
+        };
+        f.render_widget(
+            Paragraph::new(msg).fg(DIM).block(block(" Diff ", focused)),
+            area,
+        );
         return;
     };
     let lines = match &view.lines {
         Ok(l) => l,
         Err(e) => {
             f.render_widget(
-                Paragraph::new(e.clone()).fg(DEL_FG).wrap(Wrap { trim: true }).block(block(" Diff ", focused)),
+                Paragraph::new(e.clone())
+                    .fg(DEL_FG)
+                    .wrap(Wrap { trim: true })
+                    .block(block(" Diff ", focused)),
                 area,
             );
             return;
         }
     };
-    let pos = if lines.is_empty() { 0 } else { view.scroll + 1 };
+    let rows = view.rows(split);
+    let top = view.top_row(split);
+    let pos = if rows.rows.is_empty() { 0 } else { top + 1 };
     let title = Line::from(vec![
         Span::raw(" "),
         Span::styled(view.path.clone(), Style::new().bold()),
-        Span::styled(format!(" {pos}/{} ", lines.len()), Style::new().fg(DIM)),
+        Span::styled(format!(" {pos}/{} ", rows.rows.len()), Style::new().fg(DIM)),
+        Span::styled(if split { "split " } else { "" }, Style::new().fg(DIM)),
     ]);
-    let inner_w = area.width.saturating_sub(2) as usize;
-    let num_w = lines
-        .iter()
-        .filter_map(|l| l.old_no.max(l.new_no))
-        .max()
-        .unwrap_or(0)
-        .to_string()
-        .len()
-        .max(3);
-    let height = app.diff_height;
+    let ctx = CodeCtx {
+        lines,
+        highlights: &view.highlights,
+        hscroll: view.hscroll,
+        num_w: lines
+            .iter()
+            .filter_map(|l| l.old_no.max(l.new_no))
+            .max()
+            .unwrap_or(0)
+            .to_string()
+            .len()
+            .max(3),
+    };
+    let inner_w = app.diff_width;
+    let half = inner_w.saturating_sub(1) / 2;
+    let right_w = inner_w.saturating_sub(1 + half);
 
-    let rendered: Vec<Line> = lines
+    let rendered: Vec<Line> = rows
+        .rows
         .iter()
-        .skip(view.scroll)
-        .take(height)
-        .map(|l| {
-            let no = |n: Option<u32>| n.map(|n| format!("{n:>num_w$}")).unwrap_or_else(|| " ".repeat(num_w));
-            let (sign, fg, bg) = match l.kind {
-                LineKind::Added => ("+", ADD_FG, Some(ADD_BG)),
-                LineKind::Removed => ("-", DEL_FG, Some(DEL_BG)),
-                LineKind::Context => (" ", Color::Reset, None),
-                LineKind::Hunk => ("", ACCENT, None),
-                LineKind::Meta => ("", DIM, None),
-                LineKind::NoNewline => ("", DIM, None),
-            };
-            let body: String = l.text.chars().skip(view.hscroll).collect();
-            match l.kind {
-                LineKind::Meta | LineKind::Hunk | LineKind::NoNewline => {
-                    let style = if l.kind == LineKind::Hunk {
-                        Style::new().fg(fg).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::new().fg(fg)
-                    };
-                    Line::from(Span::styled(body, style))
-                }
-                _ => {
-                    let gutter = format!("{} {} ", no(l.old_no), no(l.new_no));
-                    let used = gutter.chars().count() + 1;
-                    let text_style = match bg {
-                        Some(bg) => Style::new().fg(Color::Reset).bg(bg),
-                        None => Style::new(),
-                    };
-                    // Pad changed lines so the background spans the full width.
-                    let body = if bg.is_some() {
-                        format!("{body:<w$}", w = inner_w.saturating_sub(used))
-                    } else {
-                        body
-                    };
-                    Line::from(vec![
-                        Span::styled(gutter, Style::new().fg(DIM)),
-                        Span::styled(sign, Style::new().fg(fg).bold().bg(bg.unwrap_or(Color::Reset))),
-                        Span::styled(body, text_style),
-                    ])
-                }
+        .skip(top)
+        .take(app.diff_height)
+        .map(|row| match *row {
+            Row::Full(i) => match lines[i].kind {
+                LineKind::Meta | LineKind::Hunk | LineKind::NoNewline => ctx.header(i, inner_w),
+                _ => Line::from(ctx.unified(i, inner_w)),
+            },
+            Row::Pair(old, new) => {
+                let mut spans = ctx.side(old, Side::Old, half);
+                spans.push(Span::styled("│", Style::new().fg(DIM)));
+                spans.extend(ctx.side(new, Side::New, right_w));
+                Line::from(spans)
             }
         })
         .collect();
@@ -288,18 +325,181 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(Paragraph::new(rendered).block(block(title, focused)), area);
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Old,
+    New,
+}
+
+/// Shared state for rendering code lines of one diff.
+struct CodeCtx<'a> {
+    lines: &'a [DiffLine],
+    highlights: &'a Highlights,
+    hscroll: usize,
+    num_w: usize,
+}
+
+impl CodeCtx<'_> {
+    fn header(&self, i: usize, width: usize) -> Line<'static> {
+        let l = &self.lines[i];
+        let style = match l.kind {
+            LineKind::Hunk => Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+            _ => Style::new().fg(DIM),
+        };
+        let text = clip(&l.text, self.hscroll, width, false);
+        Line::from(Span::styled(text, style))
+    }
+
+    fn num(&self, n: Option<u32>) -> String {
+        n.map(|n| format!("{n:>w$}", w = self.num_w))
+            .unwrap_or_else(|| " ".repeat(self.num_w))
+    }
+
+    /// Unified row: `old new ±code`
+    fn unified(&self, i: usize, width: usize) -> Vec<Span<'static>> {
+        let l = &self.lines[i];
+        let gutter = format!("{} {} ", self.num(l.old_no), self.num(l.new_no));
+        self.code_line(i, gutter, width)
+    }
+
+    /// One half of a split row: `num ±code`, or an empty filler.
+    fn side(&self, idx: Option<usize>, side: Side, width: usize) -> Vec<Span<'static>> {
+        let Some(i) = idx else {
+            return vec![Span::styled(" ".repeat(width), Style::new().bg(FILLER_BG))];
+        };
+        let l = &self.lines[i];
+        let no = if side == Side::Old {
+            l.old_no
+        } else {
+            l.new_no
+        };
+        self.code_line(i, format!("{} ", self.num(no)), width)
+    }
+
+    fn code_line(&self, i: usize, gutter: String, width: usize) -> Vec<Span<'static>> {
+        let l = &self.lines[i];
+        let (sign, sign_fg, bg) = match l.kind {
+            LineKind::Added => ("+", ADD_FG, Some(ADD_BG)),
+            LineKind::Removed => ("-", DEL_FG, Some(DEL_BG)),
+            _ => (" ", Color::Reset, None),
+        };
+        let gutter_w = gutter.width();
+        let code_w = width.saturating_sub(gutter_w + 1);
+        let mut spans = vec![
+            Span::styled(gutter, Style::new().fg(DIM)),
+            Span::styled(
+                sign,
+                Style::new()
+                    .fg(sign_fg)
+                    .bold()
+                    .bg(bg.unwrap_or(Color::Reset)),
+            ),
+        ];
+        let base = bg.map(|b| Style::new().bg(b)).unwrap_or_default();
+        // Always pad: keeps the split divider aligned and fills change backgrounds.
+        match self.highlights.get(i).and_then(|h| h.as_ref()) {
+            Some(hl) => spans.extend(highlighted(hl, self.hscroll, code_w, base, true)),
+            None => spans.push(Span::styled(
+                clip(&l.text, self.hscroll, code_w, true),
+                base,
+            )),
+        }
+        spans
+    }
+}
+
+fn fg_color(fg: Fg) -> Color {
+    match fg {
+        Fg::Rgb(r, g, b) => Color::Rgb(r, g, b),
+        Fg::Indexed(i) => Color::Indexed(i),
+        Fg::Default => Color::Reset,
+    }
+}
+
+/// Cut highlighted spans to the visible window `[skip, skip + width)` in display columns.
+fn highlighted(
+    hl: &[HlSpan],
+    skip: usize,
+    width: usize,
+    base: Style,
+    pad: bool,
+) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    let mut col = 0; // display column in the full line
+    let mut used = 0; // columns emitted
+    for s in hl {
+        let mut text = String::new();
+        for ch in s.text.chars() {
+            let w = ch.width().unwrap_or(0);
+            if col >= skip && used + w <= width {
+                text.push(ch);
+                used += w;
+            }
+            col += w;
+        }
+        if !text.is_empty() {
+            let mut style = base.fg(fg_color(s.fg));
+            if s.bold {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            if s.italic {
+                style = style.add_modifier(Modifier::ITALIC);
+            }
+            out.push(Span::styled(text, style));
+        }
+        if used >= width {
+            break;
+        }
+    }
+    if pad && used < width {
+        out.push(Span::styled(" ".repeat(width - used), base));
+    }
+    out
+}
+
+/// Plain text cut to `[skip, skip + width)` display columns, optionally padded to `width`.
+fn clip(text: &str, skip: usize, width: usize, pad: bool) -> String {
+    let mut out = String::new();
+    let mut col = 0;
+    let mut used = 0;
+    for ch in text.chars() {
+        let w = ch.width().unwrap_or(0);
+        if col >= skip && used + w <= width {
+            out.push(ch);
+            used += w;
+        }
+        col += w;
+        if used >= width {
+            break;
+        }
+    }
+    if pad && used < width {
+        out.push_str(&" ".repeat(width - used));
+    }
+    out
+}
+
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     let mut spans = vec![
-        Span::styled(format!(" {} ", app.mode.label()), Style::new().fg(Color::Black).bg(ACCENT).bold()),
+        Span::styled(
+            format!(" {} ", app.mode.label()),
+            Style::new().fg(Color::Black).bg(ACCENT).bold(),
+        ),
         Span::raw(" "),
     ];
     if let Some(e) = &app.herdr_error {
-        spans.push(Span::styled(format!("herdr: {} ", truncate(e, 60)), Style::new().fg(DEL_FG)));
+        spans.push(Span::styled(
+            format!("herdr: {} ", truncate(e, 60)),
+            Style::new().fg(DEL_FG),
+        ));
     }
     if app.loading {
         spans.push(Span::styled("refreshing… ", Style::new().fg(Color::Yellow)));
     } else if let Some(t) = app.last_refresh {
-        spans.push(Span::styled(format!("updated {}s ago ", t.elapsed().as_secs()), Style::new().fg(DIM)));
+        spans.push(Span::styled(
+            format!("updated {}s ago ", t.elapsed().as_secs()),
+            Style::new().fg(DIM),
+        ));
     }
     if app.non_repo_panes > 0 {
         spans.push(Span::styled(
@@ -310,9 +510,12 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     if let Some((msg, at)) = &app.message
         && at.elapsed().as_secs() < 3
     {
-        spans.push(Span::styled(format!("· {msg} "), Style::new().fg(Color::Yellow)));
+        spans.push(Span::styled(
+            format!("· {msg} "),
+            Style::new().fg(Color::Yellow),
+        ));
     }
-    let hint = " m mode  a agent  e edit  ? help  q quit ";
+    let hint = " s split  m mode  a agent  e edit  ? help  q quit ";
     let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
     let pad = (area.width as usize).saturating_sub(used + hint.len());
     spans.push(Span::raw(" ".repeat(pad)));
@@ -332,6 +535,7 @@ fn draw_help(f: &mut Frame) {
         ("g G", "diff top / bottom"),
         ("n N", "next / previous hunk"),
         ("H L", "scroll diff horizontally"),
+        ("s", "toggle side-by-side / unified view"),
         ("m", "cycle mode: uncommitted → unstaged → staged → branch"),
         ("r", "refresh now"),
         ("a", "focus repo's agent pane in herdr (repeat to cycle)"),
@@ -353,7 +557,10 @@ fn draw_help(f: &mut Frame) {
         .collect();
     f.render_widget(Clear, rect);
     f.render_widget(
-        Paragraph::new(lines).block(block(" herdiff keys (any key to close) ", true).padding(ratatui::widgets::Padding::vertical(1))),
+        Paragraph::new(lines).block(
+            block(" herdiff keys (any key to close) ", true)
+                .padding(ratatui::widgets::Padding::vertical(1)),
+        ),
         rect,
     );
 }
@@ -387,8 +594,13 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     fn app() -> App {
-        let mut app = App::new(Mode::Uncommitted);
-        let file = FileChange { path: "src/lib.rs".into(), status: Status::Modified, added: Some(1), removed: Some(1) };
+        let mut app = App::new(Mode::Uncommitted, crate::app::View::Auto);
+        let file = FileChange {
+            path: "src/lib.rs".into(),
+            status: Status::Modified,
+            added: Some(1),
+            removed: Some(1),
+        };
         app.apply_refresh(Refreshed {
             mode: Mode::Uncommitted,
             groups: vec![RepoGroup {
@@ -403,7 +615,11 @@ mod tests {
                     title: "fixing bug".into(),
                     focused: false,
                 }],
-                stats: Ok(RepoStats { branch: "main".into(), base: "HEAD".into(), files: vec![file] }),
+                stats: Ok(RepoStats {
+                    branch: "main".into(),
+                    base: "HEAD".into(),
+                    files: vec![file],
+                }),
             }],
             non_repo_panes: 0,
             herdr_error: None,
@@ -412,7 +628,10 @@ mod tests {
             root: "/r/proj".into(),
             mode: Mode::Uncommitted,
             path: "src/lib.rs".into(),
-            lines: Ok(parse_unified("@@ -1,2 +1,2 @@\n ctx\n-old line\n+new line\n")),
+            lines: Ok(parse_unified(
+                "@@ -1,2 +1,2 @@\n ctx\n-old line\n+new line\n",
+            )),
+            highlights: Vec::new(),
         });
         app
     }
@@ -423,9 +642,59 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
         let buf = term.backend().buffer().clone();
         (0..h)
-            .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn split_view_puts_old_and_new_on_one_row() {
+        let screen = render(200, 20);
+        let row = screen
+            .lines()
+            .find(|l| l.contains("old line"))
+            .expect(&screen);
+        assert!(row.contains("new line"), "{screen}");
+        // Divider sits in the same column on context and changed rows.
+        let ctx = screen.lines().find(|l| l.contains("ctx")).expect(&screen);
+        let col = |l: &str| l.chars().position(|c| c == '│');
+        let divider = |l: &str| {
+            l.char_indices()
+                .filter(|(_, c)| *c == '│')
+                .map(|(i, _)| l[..i].chars().count())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(divider(row), divider(ctx), "{screen}");
+        assert!(col(row).is_some());
+        assert!(screen.contains("split"), "{screen}");
+    }
+
+    #[test]
+    fn highlighted_spans_are_clipped_by_display_width() {
+        let hl = vec![
+            HlSpan {
+                fg: Fg::Rgb(1, 2, 3),
+                bold: false,
+                italic: false,
+                text: "let ".into(),
+            },
+            HlSpan {
+                fg: Fg::Indexed(4),
+                bold: true,
+                italic: false,
+                text: "名前 = 1".into(),
+            },
+        ];
+        let spans = highlighted(&hl, 2, 6, Style::new(), true);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        // skip "le", then "t " (2) + "名前" (4 columns) = 6
+        assert_eq!(text, "t 名前");
+        assert_eq!(spans[1].style.fg, Some(Color::Indexed(4)));
+        assert_eq!(clip("abc", 1, 4, true), "bc  ");
     }
 
     #[test]
