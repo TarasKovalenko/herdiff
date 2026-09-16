@@ -1,0 +1,39 @@
+id = "taraskovalenko.herdiff"
+name = "herdiff"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Live, syntax-highlighted diffs of the git repos your agents are working in"
+# herdiff talks to herdr over its Unix socket, so no Windows.
+platforms = ["linux", "macos"]
+
+# Needs a Rust toolchain (cargo) and git. Build output stays inside the plugin checkout.
+[[build]]
+command = ["cargo", "build", "--release", "--locked"]
+
+# Persistent viewer split beside the current pane.
+[[panes]]
+id = "viewer"
+title = "herdiff"
+placement = "split"
+command = ["target/release/herdiff"]
+
+# Quick look: modal popup over the session, gone when you press q.
+[[panes]]
+id = "popup"
+title = "herdiff"
+placement = "popup"
+width = "90%"
+height = "90%"
+command = ["target/release/herdiff"]
+
+[[actions]]
+id = "open"
+title = "herdiff: open diff viewer beside this pane"
+contexts = ["global"]
+command = ["sh", "-c", "exec \"$HERDR_BIN_PATH\" plugin pane open --plugin \"$HERDR_PLUGIN_ID\" --entrypoint viewer --focus"]
+
+[[actions]]
+id = "popup"
+title = "herdiff: quick look in a popup"
+contexts = ["global"]
+command = ["sh", "-c", "exec \"$HERDR_BIN_PATH\" plugin pane open --plugin \"$HERDR_PLUGIN_ID\" --entrypoint popup"]

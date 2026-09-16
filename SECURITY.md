@@ -31,3 +31,9 @@ point it at (by default `$HERDR_SOCKET_PATH` or `~/.config/herdr/herdr.sock`) an
   programs such as `core.fsmonitor`. Only open repos you trust, the same as running
   `git status` in them yourself.
 - No network access and no telemetry.
+
+Installed as a herdr plugin, `herdr plugin install` runs `cargo build --release --locked`
+in herdr's managed checkout. That downloads the crates pinned in `Cargo.lock` from
+crates.io and compiles them, build scripts included. The plugin's actions only call
+`herdr plugin pane open` for herdiff's own panes. It has no startup hooks and no event
+hooks, and it keeps no state in herdr's plugin config or state directories.

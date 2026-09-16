@@ -500,3 +500,20 @@ fn open_editor(path: &std::path::Path, line: Option<u32>) -> Result<()> {
     anyhow::ensure!(status.success(), "{editor} exited with {status}");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    /// The herdr marketplace shows the manifest version; keep it equal to the crate's.
+    #[test]
+    fn plugin_manifest_matches_crate() {
+        let manifest = include_str!("../herdr-plugin.toml");
+        let field = |key: &str| {
+            manifest
+                .lines()
+                .find_map(|l| l.strip_prefix(&format!("{key} = ")))
+                .map(|v| v.trim_matches('"').to_string())
+        };
+        assert_eq!(field("version").as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        assert_eq!(field("name").as_deref(), Some(env!("CARGO_PKG_NAME")));
+    }
+}

@@ -9,13 +9,51 @@ editing. Leave it open in a side pane and you can watch the work land.
 
 Diffs are syntax highlighted and switch to a side-by-side layout when there's room.
 
+## Install
+
+herdiff runs on macOS and Linux and needs `git` on your `PATH`. Both install routes
+build from source, so you also need a Rust toolchain (`cargo`).
+
+### As a herdr plugin
+
+```
+herdr plugin install TarasKovalenko/herdiff
+```
+
+herdr shows the manifest and the build command before it runs anything. The build is
+`cargo build --release --locked` inside herdr's managed checkout, and the first one takes
+a minute or two. There's no `plugin update` in herdr yet; run the install again to pick
+up a new version.
+
+The plugin adds two actions to herdr's command palette:
+
+- **herdiff: open diff viewer beside this pane** opens a split you can keep open.
+- **herdiff: quick look in a popup** opens a 90% popup. Press `q` and it's gone.
+
+To put either on a key, add this to your herdr `config.toml`:
+
+```toml
+[[keys.command]]
+key = "prefix+d"
+type = "plugin_action"
+command = "taraskovalenko.herdiff.popup"   # or taraskovalenko.herdiff.open
+description = "herdiff quick look"
+```
+
+You can also open the panes directly:
+`herdr plugin pane open --plugin taraskovalenko.herdiff --entrypoint viewer`.
+
+Like any herdr plugin, this is code running as your user. Read
+[herdr's trust guidance](https://herdr.dev/docs/plugins/#trust-and-security) and
+[SECURITY.md](SECURITY.md) for what herdiff does.
+
+### As a standalone binary
+
 ```
 cargo install --git https://github.com/TarasKovalenko/herdiff
 ```
 
 Or from a local checkout: `cargo install --path .`
-
-It needs `git` on your `PATH` and runs on macOS and Linux.
 
 ## Usage
 
@@ -29,8 +67,8 @@ herdiff --theme Nord      # pick a highlighting theme
 herdiff list --json       # print once and exit, handy for scripts
 ```
 
-It talks to herdr over its socket, so it runs in any terminal, not only inside herdr. The
-usual setup is a split next to your agents:
+The binary talks to herdr over its socket, so it runs in any terminal, not only inside
+herdr. Without the plugin, the usual setup is a split next to your agents:
 
 ```
 herdr pane split --current --direction right --no-focus

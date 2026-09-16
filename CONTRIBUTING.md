@@ -22,6 +22,16 @@ cd herdiff
 cargo run
 ```
 
+To try it as a herdr plugin, build once and link your working tree. `plugin link` doesn't
+run the manifest's build step, so rebuild yourself after changes:
+
+```sh
+cargo build --release
+herdr plugin link "$PWD"
+herdr plugin action invoke taraskovalenko.herdiff.open
+herdr plugin unlink taraskovalenko.herdiff   # when you're done
+```
+
 herdr doesn't have to be running. Without it herdiff shows the socket error in the status
 bar, and you can still point it at repos with `-d`:
 
@@ -51,6 +61,9 @@ The git tests build throwaway repos in a temp directory, so they never touch you
 - New behaviour comes with tests. Rendering is tested against ratatui's `TestBackend`
   at several sizes, down to 40×12.
 - A new key goes in the help screen (`ui.rs`) and the README key table.
+- `herdr-plugin.toml` follows [herdr's plugin docs](https://herdr.dev/docs/plugins/). Its
+  `name` and `version` must match `Cargo.toml` (a test checks this). If you start using a
+  newer herdr API, raise `min_herdr_version`.
 
 ## Commits and pull requests
 

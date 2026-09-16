@@ -162,7 +162,8 @@ fn refresh_all(
     };
     let target = resolver.resolve(scope, snap.as_ref(), ctx.me);
     let snap = snap.unwrap_or_else(Snapshot::default);
-    let mut topo = model::group_panes(&snap, &target, |d| roots.resolve(d));
+    let own_pane = ctx.me.pane_id.as_deref();
+    let mut topo = model::group_panes(&snap, &target, own_pane, |d| roots.resolve(d));
     // Repos passed with -d are always shown, whatever the scope.
     for dir in ctx.extra_dirs {
         if let Some(root) = roots.resolve(dir)

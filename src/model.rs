@@ -51,9 +51,13 @@ pub struct Topology {
 
 /// Group the panes in `target` by repo root. `resolve` maps a directory to its repo root
 /// (cached by caller). Only in-scope panes are resolved, so out-of-scope repos cost nothing.
+///
+/// `own_pane` is herdiff's own pane. It's skipped: as a herdr plugin herdiff runs inside
+/// its own git checkout, which would otherwise show up as a repo.
 pub fn group_panes(
     snap: &Snapshot,
     target: &Target,
+    own_pane: Option<&str>,
     mut resolve: impl FnMut(&Path) -> Option<PathBuf>,
 ) -> Topology {
     let ws: HashMap<&str, &str> = snap
@@ -76,6 +80,7 @@ pub fn group_panes(
         .panes
         .iter()
         .filter(|p| target.includes(&p.workspace_id))
+        .filter(|p| Some(p.pane_id.as_str()) != own_pane)
         .collect();
     panes.sort_by_key(|p| {
         (
@@ -156,12 +161,16 @@ mod tests {
             workspace_id: Some("w2".into()),
             ..all.clone()
         };
-        let scoped = group_panes(&snap, &only_w2, resolve);
+        let scoped = group_panes(&snap, &only_w2, None, resolve);
+        assert_eq!(scoped.repos.len(), 1);
+        // herdiff's own pane (here w2:p1) is never listed.
+        let without_self = group_panes(&snap, &only_w2, Some("w2:p1"), resolve);
+        assert!(without_self.repos.is_empty());
         assert_eq!(scoped.repos.len(), 1);
         assert_eq!(scoped.repos[0].0, PathBuf::from("/repo2"));
         assert_eq!(scoped.non_repo_panes, 0);
 
-        let topo = group_panes(&snap, &all, resolve);
+        let topo = group_panes(&snap, &all, None, resolve);
         assert_eq!(topo.non_repo_panes, 1);
         let roots: Vec<_> = topo
             .repos

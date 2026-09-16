@@ -54,6 +54,36 @@ Known gaps: herdr has one focus per server, so with several clients follow track
 moved last. A pane moved to another workspace gets a new ID its process never learns, so
 herdiff stops recognising its own pane until restarted.
 
+## herdr plugin
+
+herdiff ships as a [herdr plugin](https://herdr.dev/docs/plugins/) through
+`herdr-plugin.toml` at the repo root, following plugin v1:
+
+- `id = "taraskovalenko.herdiff"`, `name` and `version` equal to `Cargo.toml` (tested),
+  `min_herdr_version = "0.9.0"` (the version it was built and tested against),
+  `platforms = ["linux", "macos"]` because herdiff uses the Unix socket directly.
+- `[[build]]` runs `cargo build --release --locked`. herdr runs it on
+  `plugin install`, not on `plugin link`.
+- `[[panes]]`: `viewer` (split) and `popup` (90% popup), both launching
+  `target/release/herdiff` relative to the plugin root, which is the working directory for
+  runtime commands.
+- `[[actions]]` `open` and `popup` call `$HERDR_BIN_PATH plugin pane open` through `sh -c`
+  (manifest commands are argv with no shell expansion), so users can bind keys with
+  `type = "plugin_action"`.
+- No startup or event hooks. herdiff subscribes to events itself while it runs.
+
+Plugin panes get `HERDR_PANE_ID` and `HERDR_WORKSPACE_ID`, so scope works unchanged.
+herdiff skips its own pane when grouping, since a plugin pane's cwd is the plugin
+checkout, which is itself a git repo. A popup has no pane ID, so follow sees the focused
+tiled pane underneath and here isn't offered.
+
+The docs recommend calling herdr through `HERDR_BIN_PATH` for portability to Windows named
+pipes. herdiff uses the raw socket API instead: it needs a long-lived `events.subscribe`
+stream, and it's Unix-only anyway.
+
+It's listed on the [marketplace](https://herdr.dev/docs/marketplace/) through the
+`herdr-plugin` GitHub topic plus the root manifest on the default branch.
+
 ## Mouse
 
 Mouse capture is on unless `--no-mouse`. The renderer records each panel's rectangle and
